@@ -15,7 +15,9 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "libpq-fe.h"
+#include "miscadmin.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_server_executor.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -187,9 +189,12 @@ MultiClientConnectPoll(int32 connectionId)
 		if (readReady)
 		{
 			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection);
+			connectStatus = CLIENT_CONNECTION_BUSY;
 		}
-
-		connectStatus = CLIENT_CONNECTION_BUSY;
+		else
+		{
+			connectStatus = CLIENT_CONNECTION_BUSY_READ;
+		}
 	}
 	else if (pollingStatus == PGRES_POLLING_WRITING)
 	{
@@ -197,9 +202,12 @@ MultiClientConnectPoll(int32 connectionId)
 		if (writeReady)
 		{
 			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection);
+			connectStatus = CLIENT_CONNECTION_BUSY;
 		}
-
-		connectStatus = CLIENT_CONNECTION_BUSY;
+		else
+		{
+			connectStatus = CLIENT_CONNECTION_BUSY_WRITE;
+		}
 	}
 	else if (pollingStatus == PGRES_POLLING_FAILED)
 	{
@@ -649,6 +657,155 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 	}
 
 	return copyStatus;
+}
+
+
+/*
+ * MultiClientCreateWaitInfo creates a WaitInfo structure, capable of keeping
+ * track of what maxConnections connections are waiting for; to allow
+ * efficiently waiting for all of them at once.
+ *
+ * Connections can be added using MultiClientAddWait(). All added connections
+ * can then be waited upon together using MultiClientWait().
+ */
+WaitInfo *
+MultiClientCreateWaitInfo(int maxConnections)
+{
+	WaitInfo *waitInfo = palloc(sizeof(WaitInfo));
+
+	waitInfo->allocated = maxConnections;
+	waitInfo->waiting = 0;
+	waitInfo->pollfds = palloc(maxConnections * sizeof(struct pollfd));
+
+	return waitInfo;
+}
+
+
+/* MultiClientResetWaitInfo clears all pending waits from a WaitInfo. */
+void
+MultiClientResetWaitInfo(WaitInfo *waitInfo)
+{
+	waitInfo->waiting = 0;
+	waitInfo->haveBusy = false;
+	waitInfo->haveFailure = false;
+}
+
+
+/* MultiClientFreeWaitInfo frees a resources associated with a waitInfo struct. */
+void
+MultiClientFreeWaitInfo(WaitInfo *waitInfo)
+{
+	pfree(waitInfo->pollfds);
+	pfree(waitInfo);
+}
+
+
+/*
+ * MultiClientWaitFor adds a connection to be waited upon, waiting for
+ * waitStatus.
+ */
+void
+MultiClientRememberWait(WaitInfo *waitInfo, WaitStatus waitStatus, int32 connectionId)
+{
+	PGconn *connection = NULL;
+	struct pollfd *pollfd = NULL;
+
+	Assert(waitInfo->waiting < waitInfo->allocated);
+
+	if (waitStatus == WAIT_BUSY)
+	{
+		waitInfo->haveBusy = true;
+		return;
+	}
+	else if (waitStatus == WAIT_ERROR)
+	{
+		waitInfo->haveFailure = true;
+		return;
+	}
+
+	connection = ClientConnectionArray[connectionId];
+	pollfd = &waitInfo->pollfds[waitInfo->waiting];
+	pollfd->fd = PQsocket(connection);
+	if (waitStatus == WAIT_READ_READY)
+	{
+		pollfd->events = POLLERR | POLLIN;
+	}
+	else if (waitStatus == WAIT_WRITE_READY)
+	{
+		pollfd->events = POLLERR | POLLOUT;
+	}
+	waitInfo->waiting++;
+}
+
+
+/*
+ * MultiClientWait waits till at least one connection added with
+ * MultiClientWaitFor is ready to be processed again.
+ */
+void
+MultiClientWait(WaitInfo *waitInfo)
+{
+	long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
+
+	/*
+	 * If we had a failure, we always want to sleep for a bit, to prevent
+	 * flooding the other system, probably making the situation worse.
+	 */
+	if (waitInfo->haveFailure)
+	{
+		pg_usleep(sleepIntervalPerCycle);
+		return;
+	}
+
+	/* if there are tasks that already need attention again, don't wait */
+	if (waitInfo->haveBusy)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		/*
+		 * Wait for activity on any of the sockets. Limit the maximum time
+		 * spent waiting in one wait cycle, as insurance against edge
+		 * cases. For efficiency we don't want wake up quite as often as
+		 * citus.remote_task_check_interval, so rather arbitrarily sleep ten
+		 * times as long.
+		 */
+		int rc = poll(waitInfo->pollfds, waitInfo->waiting,
+					  sleepIntervalPerCycle * 10);
+
+		if (rc < 0)
+		{
+			/*
+			 * Signals that arrive can interrupt our poll(). In that case just
+			 * check for interrupts, and try again. Every other error is
+			 * unexpected and treated as such.
+			 */
+			if (errno == EAGAIN || errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			else
+			{
+				ereport(ERROR, (errcode_for_file_access(),
+								errmsg("poll failed: %m")));
+			}
+		}
+		else if (rc == 0)
+		{
+			ereport(DEBUG2,
+					(errmsg("waiting for activity on tasks took longer than %ld ms",
+							(long) RemoteTaskCheckInterval * 10)));
+		}
+
+		/*
+		 * At least one fd changed received a readiness notification, time to
+		 * process tasks again.
+		 */
+		return;
+	}
 }
 
 

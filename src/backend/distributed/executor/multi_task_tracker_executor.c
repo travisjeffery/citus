@@ -155,6 +155,7 @@ MultiTaskTrackerExecute(Job *job)
 	const char *taskTrackerHashName = "Task Tracker Hash";
 	const char *transmitTrackerHashName = "Transmit Tracker Hash";
 	List *jobIdList = NIL;
+	List *waitList = NIL;
 
 	/*
 	 * We walk over the task tree, and create a task execution struct for each
@@ -275,6 +276,8 @@ MultiTaskTrackerExecute(Job *job)
 				failedTaskId = taskExecution->taskId;
 				break;
 			}
+
+			waitList = lappend(waitList, taskExecution);
 		}
 
 		/* second, loop around "top level" tasks to fetch their results */
@@ -849,7 +852,9 @@ TrackerConnectPoll(TaskTracker *taskTracker)
 			{
 				taskTracker->trackerStatus = TRACKER_CONNECTED;
 			}
-			else if (pollStatus == CLIENT_CONNECTION_BUSY)
+			else if (pollStatus == CLIENT_CONNECTION_BUSY ||
+					 pollStatus == CLIENT_CONNECTION_BUSY_READ ||
+					 pollStatus == CLIENT_CONNECTION_BUSY_WRITE)
 			{
 				taskTracker->trackerStatus = TRACKER_CONNECT_POLL;
 			}
@@ -863,7 +868,8 @@ TrackerConnectPoll(TaskTracker *taskTracker)
 
 			/* now check if we have been trying to connect for too long */
 			taskTracker->connectPollCount++;
-			if (pollStatus == CLIENT_CONNECTION_BUSY)
+			if (pollStatus == CLIENT_CONNECTION_BUSY_READ ||
+				pollStatus == CLIENT_CONNECTION_BUSY_WRITE)
 			{
 				uint32 maxCount = REMOTE_NODE_CONNECT_TIMEOUT / RemoteTaskCheckInterval;
 				uint32 currentCount = taskTracker->connectPollCount;

@@ -20,6 +20,7 @@
 #include "miscadmin.h"
 
 #include <unistd.h>
+#include <poll.h>
 
 #include "commands/dbcommands.h"
 #include "distributed/multi_client_executor.h"
@@ -27,10 +28,12 @@
 #include "distributed/multi_server_executor.h"
 #include "distributed/worker_protocol.h"
 #include "storage/fd.h"
+#include "utils/timestamp.h"
 
 
 /* Local functions forward declarations */
-static ConnectAction ManageTaskExecution(Task *task, TaskExecution *taskExecution);
+static ConnectAction ManageTaskExecution(Task *task, TaskExecution *taskExecution,
+										 WaitStatus *waitStatus);
 static bool TaskExecutionReadyToStart(TaskExecution *taskExecution);
 static bool TaskExecutionCompleted(TaskExecution *taskExecution);
 static void CancelTaskExecutionIfActive(TaskExecution *taskExecution);
@@ -75,6 +78,7 @@ MultiRealTimeExecute(Job *job)
 	List *workerNodeList = NIL;
 	HTAB *workerHash = NULL;
 	const char *workerHashName = "Worker node hash";
+	WaitInfo *waitInfo = MultiClientCreateWaitInfo(list_length(taskList));
 
 	workerNodeList = WorkerNodeList();
 	workerHash = WorkerHash(workerHashName, workerNodeList);
@@ -98,12 +102,15 @@ MultiRealTimeExecute(Job *job)
 		ListCell *taskCell = NULL;
 		ListCell *taskExecutionCell = NULL;
 
+		MultiClientResetWaitInfo(waitInfo);
+
 		forboth(taskCell, taskList, taskExecutionCell, taskExecutionList)
 		{
 			Task *task = (Task *) lfirst(taskCell);
 			TaskExecution *taskExecution = (TaskExecution *) lfirst(taskExecutionCell);
 			ConnectAction connectAction = CONNECT_ACTION_NONE;
 			WorkerNodeState *workerNodeState = NULL;
+			WaitStatus waitStatus;
 
 			workerNodeState = LookupWorkerForTask(workerHash, task, taskExecution);
 
@@ -116,7 +123,7 @@ MultiRealTimeExecute(Job *job)
 			}
 
 			/* call the function that performs the core task execution logic */
-			connectAction = ManageTaskExecution(task, taskExecution);
+			connectAction = ManageTaskExecution(task, taskExecution, &waitStatus);
 
 			/* update the connection counter for throttling */
 			UpdateConnectionCounter(workerNodeState, connectAction);
@@ -138,19 +145,37 @@ MultiRealTimeExecute(Job *job)
 			{
 				completedTaskCount++;
 			}
+			else
+			{
+				uint32 currentIndex = taskExecution->currentNodeIndex;
+				int32 *connectionIdArray = taskExecution->connectionIdArray;
+				int32 connectionId = connectionIdArray[currentIndex];
+
+				/*
+				 * If not done with the task yet, remember what this task and
+				 * its associated connection is waiting for.
+				 */
+				MultiClientRememberWait(waitInfo, waitStatus, connectionId);
+			}
 		}
 
-		/* check if all tasks completed; otherwise sleep to avoid tight loop */
+		/*
+		 * Check if all tasks completed; otherwise wait as appropriate to
+		 * avoid a tight loop. That means we immediately continue if tasks are
+		 * ready to be processed further, and block when we're waiting for
+		 * network IO.
+		 */
 		if (completedTaskCount == taskCount)
 		{
 			allTasksCompleted = true;
 		}
 		else
 		{
-			long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
-			pg_usleep(sleepIntervalPerCycle);
+			MultiClientWait(waitInfo);
 		}
 	}
+
+	MultiClientFreeWaitInfo(waitInfo);
 
 	/*
 	 * We prevent cancel/die interrupts until we clean up connections to worker
@@ -171,6 +196,9 @@ MultiRealTimeExecute(Job *job)
 	/*
 	 * If cancel might have been sent, give remote backends some time to flush
 	 * their responses. This avoids some broken pipe logs on the backend-side.
+	 *
+	 * FIXME: This shouldn't be dependant on RemoteTaskCheckInterval; they're
+	 * unrelated type of delays.
 	 */
 	if (taskFailed || QueryCancelPending)
 	{
@@ -212,10 +240,11 @@ MultiRealTimeExecute(Job *job)
  * Note that this function directly manages a task's execution by opening up a
  * separate connection to the worker node for each execution. The function
  * returns a ConnectAction enum indicating whether a connection has been opened
- * or closed in this call.
+ * or closed in this call.  Via the waitStatus parameter this function returns
+ * what a Task is blocked on.
  */
 static ConnectAction
-ManageTaskExecution(Task *task, TaskExecution *taskExecution)
+ManageTaskExecution(Task *task, TaskExecution *taskExecution, WaitStatus *waitStatus)
 {
 	TaskExecStatus *taskStatusArray = taskExecution->taskStatusArray;
 	int32 *connectionIdArray = taskExecution->connectionIdArray;
@@ -227,6 +256,9 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 	char *nodeName = taskPlacement->nodeName;
 	uint32 nodePort = taskPlacement->nodePort;
 	ConnectAction connectAction = CONNECT_ACTION_NONE;
+
+	/* as most state transitions don't require blocking, default to not waiting */
+	*waitStatus = WAIT_BUSY;
 
 	switch (currentStatus)
 	{
@@ -245,12 +277,14 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			if (connectionId != INVALID_CONNECTION_ID)
 			{
 				taskStatusArray[currentIndex] = EXEC_TASK_CONNECT_POLL;
-				taskExecution->connectPollCount = 0;
+				taskExecution->connectStartTime = GetCurrentTimestamp();
 				connectAction = CONNECT_ACTION_OPENED;
 			}
 			else
 			{
+				*waitStatus = WAIT_ERROR;
 				AdjustStateForFailure(taskExecution);
+				break;
 			}
 
 			break;
@@ -272,6 +306,17 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			}
 			else if (pollStatus == CLIENT_CONNECTION_BUSY)
 			{
+				/* immediately retry */
+				taskStatusArray[currentIndex] = EXEC_TASK_CONNECT_POLL;
+			}
+			else if (pollStatus == CLIENT_CONNECTION_BUSY_READ)
+			{
+				*waitStatus = WAIT_READ_READY;
+				taskStatusArray[currentIndex] = EXEC_TASK_CONNECT_POLL;
+			}
+			else if (pollStatus == CLIENT_CONNECTION_BUSY_WRITE)
+			{
+				*waitStatus = WAIT_WRITE_READY;
 				taskStatusArray[currentIndex] = EXEC_TASK_CONNECT_POLL;
 			}
 			else if (pollStatus == CLIENT_CONNECTION_BAD)
@@ -280,12 +325,12 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			}
 
 			/* now check if we have been trying to connect for too long */
-			taskExecution->connectPollCount++;
-			if (pollStatus == CLIENT_CONNECTION_BUSY)
+			if (pollStatus == CLIENT_CONNECTION_BUSY_READ ||
+				pollStatus == CLIENT_CONNECTION_BUSY_WRITE)
 			{
-				uint32 maxCount = REMOTE_NODE_CONNECT_TIMEOUT / RemoteTaskCheckInterval;
-				uint32 currentCount = taskExecution->connectPollCount;
-				if (currentCount >= maxCount)
+				if (TimestampDifferenceExceeds(taskExecution->connectStartTime,
+											   GetCurrentTimestamp(),
+											   REMOTE_NODE_CONNECT_TIMEOUT))
 				{
 					ereport(WARNING, (errmsg("could not establish asynchronous "
 											 "connection after %u ms",
@@ -315,6 +360,12 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 
 			/* try next worker node */
 			AdjustStateForFailure(taskExecution);
+
+			/*
+			 * Add a delay, to avoid potentially excerbating problems by
+			 * looping quickly
+			 */
+			*waitStatus = WAIT_ERROR;
 
 			break;
 		}
@@ -357,6 +408,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			else
 			{
 				taskStatusArray[currentIndex] = EXEC_TASK_FAILED;
+				break;
 			}
 
 			break;
@@ -371,6 +423,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			/* check if query results are in progress or unavailable */
 			if (resultStatus == CLIENT_RESULT_BUSY)
 			{
+				*waitStatus = WAIT_READ_READY;
 				taskStatusArray[currentIndex] = EXEC_FETCH_TASK_RUNNING;
 				break;
 			}
@@ -445,6 +498,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			if (resultStatus == CLIENT_RESULT_BUSY)
 			{
 				taskStatusArray[currentIndex] = EXEC_COMPUTE_TASK_RUNNING;
+				*waitStatus = WAIT_READ_READY;
 				break;
 			}
 			else if (resultStatus == CLIENT_RESULT_UNAVAILABLE)
@@ -510,6 +564,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution)
 			if (copyStatus == CLIENT_COPY_MORE)
 			{
 				taskStatusArray[currentIndex] = EXEC_COMPUTE_TASK_COPYING;
+				*waitStatus = WAIT_READ_READY;
 			}
 			else if (copyStatus == CLIENT_COPY_DONE)
 			{
