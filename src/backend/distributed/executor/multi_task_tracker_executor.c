@@ -155,7 +155,6 @@ MultiTaskTrackerExecute(Job *job)
 	const char *taskTrackerHashName = "Task Tracker Hash";
 	const char *transmitTrackerHashName = "Transmit Tracker Hash";
 	List *jobIdList = NIL;
-	List *waitList = NIL;
 
 	/*
 	 * We walk over the task tree, and create a task execution struct for each
@@ -276,8 +275,6 @@ MultiTaskTrackerExecute(Job *job)
 				failedTaskId = taskExecution->taskId;
 				break;
 			}
-
-			waitList = lappend(waitList, taskExecution);
 		}
 
 		/* second, loop around "top level" tasks to fetch their results */
