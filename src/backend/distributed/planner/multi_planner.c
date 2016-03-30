@@ -20,6 +20,7 @@
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_server_executor.h"
 #include "distributed/modify_planner.h"
 
 #include "executor/executor.h"
@@ -84,21 +85,40 @@ CreatePhysicalPlan(Query *parse)
 	}
 	else
 	{
-		/* Create and optimize logical plan */
-		MultiTreeRoot *logicalPlan = MultiLogicalPlanCreate(parseCopy);
-		MultiLogicalPlanOptimize(logicalPlan);
+		bool routerPlannable = false;
+
+		if (TaskExecutorType == MULTI_EXECUTOR_REAL_TIME ||
+			TaskExecutorType == MULTI_EXECUTOR_ROUTER)
+		{
+			routerPlannable = MultiRouterPlannableQuery(parse);
+		}
 
 		/*
-		 * This check is here to make it likely that all node types used in
-		 * Citus are dumpable. Explain can dump logical and physical plans
-		 * using the extended outfuncs infrastructure, but it's infeasible to
-		 * test most plans. MultiQueryContainerNode always serializes the
-		 * physical plan, so there's no need to check that separately.
+		ereport(WARNING, (errmsg("Query is router plannable : %s", routerPlannable?"true":"false")));
 		 */
-		CheckNodeIsDumpable((Node *) logicalPlan);
 
-		/* Create the physical plan */
-		physicalPlan = MultiPhysicalPlanCreate(logicalPlan);
+		if (routerPlannable)
+		{
+			physicalPlan = MultiRouterPlanCreate(parse);
+		}
+		else
+		{
+			/* Create and optimize logical plan */
+			MultiTreeRoot *logicalPlan = MultiLogicalPlanCreate(parseCopy);
+			MultiLogicalPlanOptimize(logicalPlan);
+
+			/*
+			 * This check is here to make it likely that all node types used in
+			 * Citus are dumpable. Explain can dump logical and physical plans
+			 * using the extended outfuncs infrastructure, but it's infeasible to
+			 * test most plans. MultiQueryContainerNode always serializes the
+			 * physical plan, so there's no need to check that separately.
+			 */
+			CheckNodeIsDumpable((Node *) logicalPlan);
+
+			/* Create the physical plan */
+			physicalPlan = MultiPhysicalPlanCreate(logicalPlan);
+		}
 	}
 
 	return physicalPlan;

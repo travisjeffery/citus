@@ -63,6 +63,10 @@ static List * QueryRestrictList(Query *query);
 static ShardInterval * DistributedModifyShardInterval(Query *query);
 static Oid ExtractFirstDistributedTableId(Query *query);
 static Const * ExtractPartitionValue(Query *query, Var *partitionColumn);
+static bool ContainsPartitionColumnMatchExpression(Node *node, Var *partitionColumn);
+static Task * SingleShardSelectTask(Query *query);
+static ShardInterval * SingleShardSelectShardInterval(Query *query);
+static Job * SingleShardSelectJob(Query *query, Task *task);
 
 
 /*
@@ -102,7 +106,6 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	Oid distributedTableId = ExtractFirstDistributedTableId(queryTree);
 	uint32 rangeTableId = 1;
 	Var *partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
-	char partitionMethod = PartitionMethod(distributedTableId);
 	List *rangeTableList = NIL;
 	ListCell *rangeTableCell = NULL;
 	bool hasValuesScan = false;
@@ -575,7 +578,7 @@ QueryRestrictList(Query *query)
 
 		queryRestrictList = list_make1(equalityExpr);
 	}
-	else if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
+	else if (commandType == CMD_UPDATE || commandType == CMD_DELETE || commandType == CMD_SELECT)
 	{
 		queryRestrictList = WhereClauseList(query->jointree);
 	}
@@ -640,4 +643,316 @@ ExtractPartitionValue(Query *query, Var *partitionColumn)
 	}
 
 	return partitionValue;
+}
+
+
+/*
+ * ContainsPartitionColumnMatchExpression returns true if the query contains an exact
+ * match (equal) expression on the partition column. The function returns true only
+ * if the match expression has an AND relation with the rest of the expression tree.
+ */
+static bool
+ContainsPartitionColumnMatchExpression(Node *node, Var *partitionColumn)
+{
+	if (node == NULL)
+	{
+		return  false;
+	}
+
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *opExpr = (OpExpr *) node;
+		bool simpleExpression = SimpleOpExpression((Expr *)opExpr);
+		bool partitionColumnInExpr = false;
+		char *operatorName  = NULL;
+		int equalsCompare = -1;
+		bool usingEqualityOperator = false;
+
+		if (!simpleExpression)
+		{
+			return false;
+		}
+
+		partitionColumnInExpr = OpExpressionContainsColumn(opExpr, partitionColumn);
+
+		if (!partitionColumnInExpr)
+		{
+			return false;
+		}
+
+		operatorName = get_opname(opExpr->opno);
+		equalsCompare = strncmp(operatorName, EQUAL_OPERATOR_STRING, NAMEDATALEN);
+		usingEqualityOperator = (equalsCompare == 0);
+		if (usingEqualityOperator)
+		{
+			return true;
+		}
+	}
+	else if (IsA(node, BoolExpr))
+	{
+		BoolExpr *boolExpr = (BoolExpr *) node;
+
+		if (boolExpr->boolop == AND_EXPR)
+		{
+			List *argumentList = boolExpr->args;
+			ListCell *argumentCell = NULL;
+
+			foreach(argumentCell, argumentList)
+			{
+				Node *argumentNode = (Node *) lfirst(argumentCell);
+				bool partitionColumnMatch =
+					ContainsPartitionColumnMatchExpression(argumentNode, partitionColumn);
+
+				if (partitionColumnMatch)
+				{
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * MultiRouterPlannableQuery returns true if given query can be router plannable.
+ * The query is router plannable if it is a select query issued on a hash
+ * partitioned distributed table, and it has a exact match comparison on the
+ * partition column. This feature is enabled if task executor is set to real-time or
+ * router.
+*/
+bool
+MultiRouterPlannableQuery(Query *query)
+{
+	uint32 rangeTableId = 1;
+	List *rangeTableList = NIL;
+	Oid distributedTableId = InvalidOid;
+	Var *partitionColumn = NULL;
+	char partitionMethod = '\0';
+	Node *quals = NULL;
+	CmdType commandType = query->commandType;
+	FromExpr *joinTree = query->jointree;
+	List *varClauseList = NIL;
+	ListCell *varClauseCell = NULL;
+	bool partitionColumnMatchExpression = false;
+	int partitionColumnReferenceCount = 0;
+	int shardCount = 0;
+
+	Assert(commandType == CMD_SELECT);
+
+
+	/*
+	 * Reject subqueries which are in SELECT or WHERE clause.
+	 * Queries which include subqueries in FROM clauses, CommonTableExpr
+	 * are also rejected below.
+	 */
+	if (query->hasSubLinks == true || query->cteList != NIL)
+	{
+		return false;
+	}
+
+
+	/* only hash partitioned tables are supported */
+	distributedTableId = ExtractFirstDistributedTableId(query);
+	partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
+	partitionMethod = PartitionMethod(distributedTableId);
+
+	if (partitionMethod != DISTRIBUTE_BY_HASH)
+	{
+		return false;
+	}
+
+	/* extract range table entries */
+	ExtractRangeTableEntryWalker((Node *) query, &rangeTableList);
+
+	/* query can have only one range table of type RTE_RELATION */
+	if (list_length(rangeTableList) != 1)
+	{
+		return false;
+	}
+	else
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) linitial(rangeTableList);
+		if (rangeTableEntry->rtekind != RTE_RELATION)
+		{
+			return false;
+		}
+	}
+
+	if (joinTree == NULL)
+	{
+		return false;
+	}
+
+	if ((joinTree != NULL) && (joinTree->quals != NULL))
+	{
+		quals = joinTree->quals;
+		if (IsA(quals, List))
+		{
+			quals = (Node *) make_ands_explicit((List *) quals);
+		}
+	}
+
+	partitionColumnMatchExpression =
+		ContainsPartitionColumnMatchExpression(quals, partitionColumn);
+
+	if (!partitionColumnMatchExpression)
+	{
+		return false;
+	}
+
+	/* make sure partition column is used only once in the query */
+	varClauseList = pull_var_clause_default(quals);
+	foreach(varClauseCell, varClauseList)
+	{
+		Var *column = (Var *) lfirst(varClauseCell);
+		if (equal(column, partitionColumn))
+		{
+			partitionColumnReferenceCount++;
+		}
+	}
+
+	if (partitionColumnReferenceCount != 1)
+	{
+		return false;
+	}
+
+	shardCount = ShardIntervalCount(distributedTableId);
+
+	if (shardCount == 0)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/* MultiRouterPlanCreate creates a physical plan for given router plannable query. */
+MultiPlan *
+MultiRouterPlanCreate(Query *query)
+{
+	Task *task = NULL;
+	Job *job = NULL;
+	MultiPlan *multiPlan = NULL;
+
+	task = SingleShardSelectTask(query);
+
+	job = SingleShardSelectJob(query,task);
+
+	multiPlan = CitusMakeNode(MultiPlan);
+	multiPlan->workerJob = job;
+	multiPlan->masterQuery = NULL;
+	multiPlan->masterTableName = NULL;
+
+	return multiPlan;
+}
+
+
+/* SingleShardSelectTask builds a Task to represent a single shard select query */
+static Task *
+SingleShardSelectTask(Query *query)
+{
+	Task *task = NULL;
+	ShardInterval *shardInterval = SingleShardSelectShardInterval(query);
+	StringInfo queryString = makeStringInfo();
+	uint64 shardId = INVALID_SHARD_ID;
+	bool upsertQuery = false;
+	CmdType commandType = query->commandType;
+	FromExpr *joinTree = NULL;
+
+	Assert(shardInterval != NULL);
+	Assert(commandType == CMD_SELECT);
+
+	shardId = shardInterval->shardId;
+
+	/*
+	 * Convert the qualifiers to an explicitly and'd clause, which is needed
+	 * before we deparse the query.
+	 */
+	joinTree = query->jointree;
+	if ((joinTree != NULL) && (joinTree->quals != NULL))
+	{
+		Node *whereClause = joinTree->quals;
+		if (IsA(whereClause, List))
+		{
+			joinTree->quals = (Node *) make_ands_explicit((List *) whereClause);
+		}
+	}
+
+	deparse_shard_query(query, shardInterval->relationId, shardId, queryString);
+	ereport(DEBUG4, (errmsg("distributed statement: %s", queryString->data)));
+
+	task = CitusMakeNode(Task);
+	task->jobId = INVALID_JOB_ID;
+	task->taskId = INVALID_TASK_ID;
+	task->taskType = ROUTER_TASK;
+	task->queryString = queryString->data;
+	task->anchorShardId = shardId;
+	task->dependedTaskList = NIL;
+	task->upsertQuery = upsertQuery;
+
+	return task;
+}
+
+
+/*
+ * SingleShardSelectShardInterval determines the single shard targeted by a
+ * provided distributed modification command. If no matching shards exist, or
+ * if the modification targets more than one one shard, this function raises
+ * an error.
+ */
+static ShardInterval *
+SingleShardSelectShardInterval(Query *query)
+{
+	List *restrictClauseList = NIL;
+	List *prunedShardList = NIL;
+	Index tableId = 1;
+
+	Oid distributedTableId = ExtractFirstDistributedTableId(query);
+	List *shardIntervalList = NIL;
+
+	/* error out if no shards exist for the table */
+	shardIntervalList = LoadShardIntervalList(distributedTableId);
+	if (shardIntervalList == NIL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("could not find any shards for this table")));
+	}
+
+	restrictClauseList = QueryRestrictList(query);
+	prunedShardList = PruneShardList(distributedTableId, tableId, restrictClauseList,
+									 shardIntervalList);
+
+	Assert(list_length(prunedShardList) <= 1);
+
+	if (list_length(prunedShardList) > 1)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("router executor queries must target exactly one "
+							   "shard")));
+	}
+
+	return (ShardInterval *) linitial(prunedShardList);
+}
+
+
+/*
+ * SingleShardSelectJob creates a Job for the specified query to execute the
+ * provided single shard select task.*/
+Job *
+SingleShardSelectJob(Query *query, Task *task)
+{
+	Job *job = NULL;
+	List *taskList = FirstReplicaAssignTaskList(list_make1(task));
+
+	job = CitusMakeNode(Job);
+	job->dependedJobList = NIL;
+	job->jobId = INVALID_JOB_ID;
+	job->subqueryPushdown = false;
+	job->jobQuery = query;
+	job->taskList = taskList;
+
+	return job;
 }

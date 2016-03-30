@@ -56,9 +56,11 @@ JobExecutorType(MultiPlan *multiPlan)
 	if (taskCount > 0)
 	{
 		Task *firstTask = (Task *) linitial(workerTaskList);
+		TaskType taskType = firstTask->taskType;
 
-		if (firstTask->taskType == MODIFY_TASK)
+		if (taskType == MODIFY_TASK || taskType == ROUTER_TASK)
 		{
+			Assert(taskCount == 1);
 			return MULTI_EXECUTOR_ROUTER;
 		}
 	}

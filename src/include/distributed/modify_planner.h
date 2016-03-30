@@ -31,5 +31,7 @@
 
 
 extern MultiPlan * MultiModifyPlanCreate(Query *query);
+extern bool MultiRouterPlannableQuery(Query *query);
+extern MultiPlan * MultiRouterPlanCreate(Query *query);
 
 #endif /* MODIFY_PLANNER_H */

@@ -130,7 +130,6 @@ static OperatorCacheEntry * LookupOperatorByType(Oid typeId, Oid accessMethodId,
 												 int16 strategyNumber);
 static Oid GetOperatorByType(Oid typeId, Oid accessMethodId, int16 strategyNumber);
 static Node * HashableClauseMutator(Node *originalNode, Var *partitionColumn);
-static bool OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn);
 static Var * MakeInt4Column(void);
 static Const * MakeInt4Constant(Datum constantValue);
 static OpExpr * MakeHashedOperatorExpression(OpExpr *operatorExpression);
@@ -2937,7 +2936,7 @@ HashableClauseMutator(Node *originalNode, Var *partitionColumn)
  * operator expression which means it is a binary operator expression with
  * operands of a var and a non-null constant.
  */
-static bool
+bool
 OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn)
 {
 	Node *leftOperand = get_leftop((Expr *) operatorExpression);

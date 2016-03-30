@@ -76,7 +76,8 @@ typedef enum
 	SHARD_FETCH_TASK = 4,
 	MAP_OUTPUT_FETCH_TASK = 5,
 	MERGE_FETCH_TASK = 6,
-	MODIFY_TASK = 7
+	MODIFY_TASK = 7,
+	ROUTER_TASK = 8
 } TaskType;
 
 
@@ -231,6 +232,7 @@ extern OpExpr * MakeOpExpression(Var *variable, int16 strategyNumber);
 extern Node * BuildBaseConstraint(Var *column);
 extern void UpdateConstraint(Node *baseConstraint, ShardInterval *shardInterval);
 extern bool SimpleOpExpression(Expr *clause);
+extern bool OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn);
 
 extern int CompareShardPlacements(const void *leftElement, const void *rightElement);
 
