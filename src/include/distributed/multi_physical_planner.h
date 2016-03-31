@@ -220,6 +220,7 @@ extern MultiPlan * MultiPhysicalPlanCreate(MultiTreeRoot *multiTree);
 extern StringInfo ShardFetchQueryString(uint64 shardId);
 
 /* Function declarations for shard pruning */
+extern bool ExtractPartitionHashValue(Node *originalNode, void **context);
 extern List * PruneShardList(Oid relationId, Index tableId, List *whereClauseList,
 							 List *shardList);
 extern OpExpr * MakeOpExpression(Var *variable, int16 strategyNumber);

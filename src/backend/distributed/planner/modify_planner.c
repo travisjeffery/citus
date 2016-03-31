@@ -347,12 +347,19 @@ ErrorIfQueryNotSupported(Query *queryTree)
 static Task *
 DistributedModifyTask(Query *query)
 {
+	Oid distributedTableId = ExtractFirstDistributedTableId(query);
+	Var *partitionColumn = PartitionColumn(distributedTableId, 1);
+
 	ShardInterval *shardInterval = DistributedModifyShardInterval(query);
 	uint64 shardId = shardInterval->shardId;
 	FromExpr *joinTree = NULL;
 	StringInfo queryString = makeStringInfo();
 	Task *modifyTask = NULL;
 	bool upsertQuery = false;
+	List *restrictClauseList = QueryRestrictList(query);
+	void *hashContext[2] = { partitionColumn, NULL };
+	bool hashEqualityPresent = ExtractPartitionHashValue((Node *) restrictClauseList,
+														 hashContext);
 
 	/* grab shared metadata lock to stop concurrent placement additions */
 	LockShardDistributionMetadata(shardId, ShareLock);
@@ -409,6 +416,12 @@ DistributedModifyTask(Query *query)
 	modifyTask->anchorShardId = shardId;
 	modifyTask->dependedTaskList = NIL;
 	modifyTask->upsertQuery = upsertQuery;
+
+	if (hashEqualityPresent)
+	{
+		int32 hashValue = DatumGetInt32(hashContext[1]);
+		modifyTask->partitionId = (uint32) hashValue;
+	}
 
 	return modifyTask;
 }
@@ -512,6 +525,7 @@ DistributedModifyShardInterval(Query *query)
 	Index tableId = 1;
 
 	Oid distributedTableId = ExtractFirstDistributedTableId(query);
+	Var *partitionColumn = PartitionColumn(distributedTableId, tableId);
 	List *shardIntervalList = NIL;
 
 	/* error out if no shards exist for the table */

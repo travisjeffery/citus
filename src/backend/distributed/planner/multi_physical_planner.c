@@ -133,6 +133,7 @@ static Node * HashableClauseMutator(Node *originalNode, Var *partitionColumn);
 static bool OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn);
 static Var * MakeInt4Column(void);
 static Const * MakeInt4Constant(Datum constantValue);
+static Const * HashOperatorExpressionValue(OpExpr *operatorExpression);
 static OpExpr * MakeHashedOperatorExpression(OpExpr *operatorExpression);
 static OpExpr * MakeOpExpressionWithZeroConst(void);
 static List * BuildRestrictInfoList(List *qualList);
@@ -2838,6 +2839,72 @@ SimpleOpExpression(Expr *clause)
 }
 
 
+bool
+ExtractPartitionHashValue(Node *originalNode, void **context)
+{
+	Var *partitionColumn = (Var *) context[0];
+	Const *partitionHashValue = NULL;
+
+	if (originalNode == NULL)
+	{
+		return true;
+	}
+
+	if (IsA(originalNode, OpExpr))
+	{
+		OpExpr *operatorExpression = (OpExpr *) originalNode;
+		bool hasPartitionColumn = false;
+
+		Oid leftHashFunction = InvalidOid;
+		Oid rightHashFunction = InvalidOid;
+		bool hasHashFunction = get_op_hash_functions(operatorExpression->opno,
+													 &leftHashFunction,
+													 &rightHashFunction);
+
+		bool simpleOpExpression = SimpleOpExpression((Expr *) operatorExpression);
+		if (simpleOpExpression)
+		{
+			hasPartitionColumn = OpExpressionContainsColumn(operatorExpression,
+															partitionColumn);
+		}
+
+		if (hasHashFunction && hasPartitionColumn)
+		{
+			partitionHashValue = HashOperatorExpressionValue((OpExpr *) originalNode);
+		}
+	}
+	else if (IsA(originalNode, NullTest))
+	{
+		NullTest *nullTest = (NullTest *) originalNode;
+		Var *column = NULL;
+
+		Expr *nullTestOperand = nullTest->arg;
+		if (IsA(nullTestOperand, Var))
+		{
+			column = (Var *) nullTestOperand;
+		}
+
+		if ((column != NULL) && equal(column, partitionColumn) &&
+			(nullTest->nulltesttype == IS_NULL))
+		{
+			partitionHashValue = MakeInt4Constant(0);
+		}
+	}
+
+	if (partitionHashValue == NULL)
+	{
+		return expression_tree_walker(originalNode, ExtractPartitionHashValue,
+									  (void *) context);
+	}
+	else
+	{
+		context[1] = (void *) partitionHashValue;
+	}
+
+	return (context[1] != NULL);
+}
+
+
 /*
  * HashableClauseMutator walks over the original where clause list, replaces
  * hashable nodes with hashed versions and keeps other nodes as they are.
@@ -2958,6 +3025,60 @@ OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn)
 	}
 
 	return equal(column, partitionColumn);
+}
+
+
+static Const *
+HashOperatorExpressionValue(OpExpr *operatorExpression)
+{
+	const Oid hashResultTypeId = INT4OID;
+	TypeCacheEntry *hashResultTypeEntry = NULL;
+	Oid operatorId = InvalidOid;
+	Var *hashedColumn = NULL;
+	Datum hashedValue = 0;
+	Const *hashedConstant = NULL;
+	FmgrInfo *hashFunction = NULL;
+	TypeCacheEntry *typeEntry = NULL;
+
+	Node *leftOperand = get_leftop((Expr *) operatorExpression);
+	Node *rightOperand = get_rightop((Expr *) operatorExpression);
+	Const *constant = NULL;
+
+	if (IsA(rightOperand, Const))
+	{
+		constant = (Const *) rightOperand;
+	}
+	else
+	{
+		constant = (Const *) leftOperand;
+	}
+
+	/* Load the operator from type cache */
+	hashResultTypeEntry = lookup_type_cache(hashResultTypeId, TYPECACHE_EQ_OPR);
+	operatorId = hashResultTypeEntry->eq_opr;
+
+	/* Get a column with int4 type */
+	hashedColumn = MakeInt4Column();
+
+	/* Load the hash function from type cache */
+	typeEntry = lookup_type_cache(constant->consttype, TYPECACHE_HASH_PROC_FINFO);
+	hashFunction = &(typeEntry->hash_proc_finfo);
+	if (!OidIsValid(hashFunction->fn_oid))
+	{
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_FUNCTION),
+						errmsg("could not identify a hash function for type %s",
+							   format_type_be(constant->consttype)),
+						errdatatype(constant->consttype)));
+	}
+
+	/*
+	 * Note that any changes to PostgreSQL's hashing functions will change the
+	 * new value created by this function.
+	 */
+	hashedValue = FunctionCall1(hashFunction, constant->constvalue);
+	hashedConstant = MakeInt4Constant(hashedValue);
+
+	return hashedConstant;
 }
 
 

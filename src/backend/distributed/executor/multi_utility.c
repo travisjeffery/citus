@@ -583,6 +583,7 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 	{
 		RangeVar *relation = createIndexStatement->relation;
 		bool missingOk = false;
+
 		/* caller uses ShareLock for non-concurrent indexes, use the same lock here */
 		LOCKMODE lockMode = ShareLock;
 		Oid relationId = RangeVarGetRelid(relation, lockMode, missingOk);
