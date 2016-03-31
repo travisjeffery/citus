@@ -91,6 +91,12 @@ RouterExecutorStart(QueryDesc *queryDesc, int eflags, Task *task)
 	{
 		AcquireExecutorShardLock(task, lockMode);
 	}
+
+	if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
+	{
+		uint64 modificationPartitionId = (task->partitionId >> 16) + 1;
+		LockShardResource(modificationPartitionId, ExclusiveLock);
+	}
 }
 
 
@@ -136,7 +142,7 @@ CommutativityRuleToLockMode(CmdType commandType, bool upsertQuery)
 	}
 	else if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
 	{
-		lockMode = ExclusiveLock;
+		lockMode = ShareLock;
 	}
 	else
 	{
