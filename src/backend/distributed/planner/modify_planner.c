@@ -419,7 +419,8 @@ DistributedModifyTask(Query *query)
 
 	if (hashEqualityPresent)
 	{
-		int32 hashValue = DatumGetInt32(hashContext[1]);
+		Const *hashConst = (Const *) hashContext[1];
+		int32 hashValue = DatumGetInt32(hashConst->constvalue);
 		modifyTask->partitionId = (uint32) hashValue;
 	}
 
