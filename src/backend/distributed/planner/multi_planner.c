@@ -93,12 +93,9 @@ CreatePhysicalPlan(Query *parse)
 			routerPlannable = MultiRouterPlannableQuery(parse);
 		}
 
-		/*
-		ereport(WARNING, (errmsg("Query is router plannable : %s", routerPlannable?"true":"false")));
-		 */
-
 		if (routerPlannable)
 		{
+			ereport(DEBUG2, (errmsg("Creating router plan")));
 			physicalPlan = MultiRouterPlanCreate(parse);
 		}
 		else

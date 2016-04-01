@@ -945,7 +945,7 @@ Job *
 SingleShardSelectJob(Query *query, Task *task)
 {
 	Job *job = NULL;
-	List *taskList = FirstReplicaAssignTaskList(list_make1(task));
+	List *taskList = AssignAnchorShardTaskList(list_make1(task));
 
 	job = CitusMakeNode(Job);
 	job->dependedJobList = NIL;

@@ -160,7 +160,6 @@ static uint64 AnchorShardId(List *fragmentList, uint32 anchorRangeTableId);
 static List * PruneSqlTaskDependencies(List *sqlTaskList);
 static List * AssignTaskList(List *sqlTaskList);
 static bool HasMergeTaskDependencies(List *sqlTaskList);
-static List * AssignAnchorShardTaskList(List *taskList);
 static List * GreedyAssignTaskList(List *taskList);
 static Task * GreedyAssignTask(WorkerNode *workerNode, List *taskList,
 							   List *activeShardPlacementLists);
@@ -4800,7 +4799,7 @@ TaskListUnion(const List *list1, const List *list2)
  * configured task assignment policy. The distributed executor later sends these
  * tasks to their assigned locations for remote execution.
  */
-static List *
+List *
 AssignAnchorShardTaskList(List *taskList)
 {
 	List *assignedTaskList = NIL;
