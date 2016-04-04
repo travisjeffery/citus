@@ -7,8 +7,8 @@ ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103200;
 CREATE TABLE articles_hash (
 	id bigint NOT NULL,
 	author_id bigint NOT NULL,
-	title text NOT NULL,
-	word_count integer NOT NULL CHECK (word_count > 0)
+	title varchar(20) NOT NULL,
+	word_count integer
 );
 
 -- Check for the existence of line 'DEBUG:  Creating router plan'
@@ -238,7 +238,7 @@ SELECT max(word_count) as max, min(word_count) as min,
 	WHERE author_id = 2;
 
 
--- error out for queries with aggregates and GROUP BY
+-- queries with aggregates and group by supported on single shard
 SELECT max(word_count)
 	FROM articles_hash
 	WHERE author_id = 1

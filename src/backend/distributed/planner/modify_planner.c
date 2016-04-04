@@ -662,7 +662,7 @@ ContainsPartitionColumnMatchExpression(Node *node, Var *partitionColumn)
 	if (IsA(node, OpExpr))
 	{
 		OpExpr *opExpr = (OpExpr *) node;
-		bool simpleExpression = SimpleOpExpression((Expr *)opExpr);
+		bool simpleExpression = SimpleOpExpression((Expr *) opExpr);
 		bool partitionColumnInExpr = false;
 		char *operatorName  = NULL;
 		int equalsCompare = -1;
@@ -674,7 +674,6 @@ ContainsPartitionColumnMatchExpression(Node *node, Var *partitionColumn)
 		}
 
 		partitionColumnInExpr = OpExpressionContainsColumn(opExpr, partitionColumn);
-
 		if (!partitionColumnInExpr)
 		{
 			return false;
@@ -683,30 +682,29 @@ ContainsPartitionColumnMatchExpression(Node *node, Var *partitionColumn)
 		operatorName = get_opname(opExpr->opno);
 		equalsCompare = strncmp(operatorName, EQUAL_OPERATOR_STRING, NAMEDATALEN);
 		usingEqualityOperator = (equalsCompare == 0);
-		if (usingEqualityOperator)
-		{
-			return true;
-		}
+
+		return usingEqualityOperator;
 	}
 	else if (IsA(node, BoolExpr))
 	{
 		BoolExpr *boolExpr = (BoolExpr *) node;
+		List *argumentList = boolExpr->args;
+		ListCell *argumentCell = NULL;
 
-		if (boolExpr->boolop == AND_EXPR)
+		if (boolExpr->boolop != AND_EXPR)
 		{
-			List *argumentList = boolExpr->args;
-			ListCell *argumentCell = NULL;
+			return false;
+		}
 
-			foreach(argumentCell, argumentList)
+		foreach(argumentCell, argumentList)
+		{
+			Node *argumentNode = (Node *) lfirst(argumentCell);
+			bool partitionColumnMatch =
+				ContainsPartitionColumnMatchExpression(argumentNode, partitionColumn);
+
+			if (partitionColumnMatch)
 			{
-				Node *argumentNode = (Node *) lfirst(argumentCell);
-				bool partitionColumnMatch =
-					ContainsPartitionColumnMatchExpression(argumentNode, partitionColumn);
-
-				if (partitionColumnMatch)
-				{
-					return true;
-				}
+				return true;
 			}
 		}
 	}
@@ -727,6 +725,7 @@ MultiRouterPlannableQuery(Query *query)
 {
 	uint32 rangeTableId = 1;
 	List *rangeTableList = NIL;
+	RangeTblEntry *rangeTableEntry = NULL;
 	Oid distributedTableId = InvalidOid;
 	Var *partitionColumn = NULL;
 	char partitionMethod = '\0';
@@ -741,17 +740,25 @@ MultiRouterPlannableQuery(Query *query)
 
 	Assert(commandType == CMD_SELECT);
 
-
 	/*
 	 * Reject subqueries which are in SELECT or WHERE clause.
-	 * Queries which include subqueries in FROM clauses, CommonTableExpr
-	 * are also rejected below.
+	 * Queries which are recursive, with CommonTableExpr, with locking (hasForUpdate),
+	 * or with window functions are also rejected here.
+	 * Queries which have subqueries, or tablesamples in FROM clauses are rejected later
+	 * during RangeTblEntry checks.
 	 */
-	if (query->hasSubLinks == true || query->cteList != NIL)
+	if (query->hasSubLinks == true || query->cteList != NIL || query->hasForUpdate ||
+		query->hasRecursive || query->hasWindowFuncs)
 	{
 		return false;
 	}
 
+#if (PG_VERSION_NUM >= 90500)
+	if (query->groupingSets)
+	{
+		return false;
+	}
+#endif
 
 	/* only hash partitioned tables are supported */
 	distributedTableId = ExtractFirstDistributedTableId(query);
@@ -771,29 +778,38 @@ MultiRouterPlannableQuery(Query *query)
 	{
 		return false;
 	}
-	else
+
+	rangeTableEntry = (RangeTblEntry *) linitial(rangeTableList);
+	if (rangeTableEntry->rtekind != RTE_RELATION)
 	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) linitial(rangeTableList);
-		if (rangeTableEntry->rtekind != RTE_RELATION)
-		{
-			return false;
-		}
+		return false;
 	}
+
+#if (PG_VERSION_NUM >= 90500)
+	if (rangeTableEntry->tablesample)
+	{
+		return false;
+	}
+#endif
 
 	if (joinTree == NULL)
 	{
 		return false;
 	}
 
-	if ((joinTree != NULL) && (joinTree->quals != NULL))
+	quals = joinTree->quals;
+	if (quals == NULL)
 	{
-		quals = joinTree->quals;
-		if (IsA(quals, List))
-		{
-			quals = (Node *) make_ands_explicit((List *) quals);
-		}
+		return false;
 	}
 
+	/* convert list of expressions into expression tree */
+	if (quals != NULL && IsA(quals, List))
+	{
+		quals = (Node *) make_ands_explicit((List *) quals);
+	}
+
+	/* partition column must be used in a simple equality match check */
 	partitionColumnMatchExpression =
 		ContainsPartitionColumnMatchExpression(quals, partitionColumn);
 
@@ -818,8 +834,11 @@ MultiRouterPlannableQuery(Query *query)
 		return false;
 	}
 
+	/*
+	 * We need to make sure there is at least one shard for this
+	 * hash partitioned query.
+	 */
 	shardCount = ShardIntervalCount(distributedTableId);
-
 	if (shardCount == 0)
 	{
 		return false;
@@ -874,11 +893,8 @@ SingleShardSelectTask(Query *query)
 	joinTree = query->jointree;
 	if ((joinTree != NULL) && (joinTree->quals != NULL))
 	{
-		Node *whereClause = joinTree->quals;
-		if (IsA(whereClause, List))
-		{
-			joinTree->quals = (Node *) make_ands_explicit((List *) whereClause);
-		}
+		Node *whereClause = (Node *) make_ands_explicit((List *) joinTree->quals);
+		joinTree->quals = whereClause;
 	}
 
 	deparse_shard_query(query, shardInterval->relationId, shardId, queryString);
@@ -909,32 +925,32 @@ SingleShardSelectShardInterval(Query *query)
 	List *restrictClauseList = NIL;
 	List *prunedShardList = NIL;
 	Index tableId = 1;
-
 	Oid distributedTableId = ExtractFirstDistributedTableId(query);
+	int remainingShardCount = 0;
 	List *shardIntervalList = NIL;
+	ShardInterval *targetShardInterval = NULL;
 
 	/* error out if no shards exist for the table */
 	shardIntervalList = LoadShardIntervalList(distributedTableId);
-	if (shardIntervalList == NIL)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("could not find any shards for this table")));
-	}
+	Assert(list_length(shardIntervalList) > 0);
 
 	restrictClauseList = QueryRestrictList(query);
 	prunedShardList = PruneShardList(distributedTableId, tableId, restrictClauseList,
 									 shardIntervalList);
 
-	Assert(list_length(prunedShardList) <= 1);
+	remainingShardCount = list_length(prunedShardList);
 
-	if (list_length(prunedShardList) > 1)
+	Assert(remainingShardCount == 1);
+
+	if (remainingShardCount != 1)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("router executor queries must target exactly one "
-							   "shard")));
+						errmsg("router executor queries must target exactly one shard")));
 	}
 
-	return (ShardInterval *) linitial(prunedShardList);
+	targetShardInterval = (ShardInterval *) linitial(prunedShardList);
+
+	return targetShardInterval;
 }
 
 

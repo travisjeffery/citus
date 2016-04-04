@@ -60,7 +60,9 @@ JobExecutorType(MultiPlan *multiPlan)
 
 		if (taskType == MODIFY_TASK || taskType == ROUTER_TASK)
 		{
+			/* router planner creates a single task */
 			Assert(taskCount == 1);
+
 			return MULTI_EXECUTOR_ROUTER;
 		}
 	}

@@ -5,8 +5,8 @@ ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103200;
 CREATE TABLE articles_hash (
 	id bigint NOT NULL,
 	author_id bigint NOT NULL,
-	title text NOT NULL,
-	word_count integer NOT NULL CHECK (word_count > 0)
+	title varchar(20) NOT NULL,
+	word_count integer
 );
 -- Check for the existence of line 'DEBUG:  Creating router plan'
 -- to determine if router planner is used.
@@ -166,7 +166,6 @@ SELECT title, author_id FROM articles_hash
 	WHERE author_id = 7 OR author_id = 8
 	ORDER BY author_id ASC, id;
 DEBUG:  predicate pruning for shardId 103201
-DEBUG:  building index "pg_toast_18556_index" on table "pg_toast_18556"
     title    | author_id 
 -------------+-----------
  aseptic     |         7
@@ -435,7 +434,7 @@ DEBUG:  predicate pruning for shardId 103200
  18185 | 2728 | 61782 |   5
 (1 row)
 
--- error out for queries with aggregates and GROUP BY
+-- queries with aggregates and group by supported on single shard
 SELECT max(word_count)
 	FROM articles_hash
 	WHERE author_id = 1
@@ -469,7 +468,6 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and author_id >= 1;
 DEBUG:  predicate pruning for shardId 103201
-DEBUG:  building index "pg_toast_18562_index" on table "pg_toast_18562"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
@@ -483,7 +481,6 @@ DEBUG:  building index "pg_toast_18562_index" on table "pg_toast_18562"
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 or id = 1;
-DEBUG:  building index "pg_toast_18568_index" on table "pg_toast_18568"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
@@ -520,7 +517,6 @@ DEBUG:  predicate pruning for shardId 103201
 SELECT *
 	FROM articles_hash
 	WHERE author_id = (random()::int  * 0 + 1);
-DEBUG:  building index "pg_toast_18574_index" on table "pg_toast_18574"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
@@ -534,7 +530,6 @@ DEBUG:  building index "pg_toast_18574_index" on table "pg_toast_18574"
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 or id = 1;
-DEBUG:  building index "pg_toast_18580_index" on table "pg_toast_18580"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
@@ -564,7 +559,6 @@ DEBUG:  predicate pruning for shardId 103201
 SELECT *
 	FROM articles_hash
 	WHERE 1 = abs(author_id);
-DEBUG:  building index "pg_toast_18586_index" on table "pg_toast_18586"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
@@ -578,7 +572,6 @@ DEBUG:  building index "pg_toast_18586_index" on table "pg_toast_18586"
 SELECT *
 	FROM articles_hash
 	WHERE author_id = abs(author_id - 2);
-DEBUG:  building index "pg_toast_18592_index" on table "pg_toast_18592"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
@@ -603,7 +596,6 @@ DEBUG:  predicate pruning for shardId 103201
 SELECT *
 	FROM articles_hash
 	WHERE (author_id = 1) is true;
-DEBUG:  building index "pg_toast_18598_index" on table "pg_toast_18598"
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
   1 |         1 | arsenous     |       9572
