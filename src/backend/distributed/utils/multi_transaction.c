@@ -135,10 +135,11 @@ AbortRemoteTransactions(List *connectionList)
 
 /*
  * CommitRemoteTransactions commits all transactions on connections in connectionList.
- * On failure, it reports a warning and continues committing all of them.
+ * If stopOnFailure is true, then CommitRemoteTransactions reports an error on
+ * failure, otherwise it reports a warning.
  */
 void
-CommitRemoteTransactions(List *connectionList)
+CommitRemoteTransactions(List *connectionList, bool stopOnFailure)
 {
 	ListCell *connectionCell = NULL;
 
@@ -167,10 +168,20 @@ CommitRemoteTransactions(List *connectionList)
 				char *nodePort = ConnectionGetOptionValue(connection, "port");
 
 				/* log a warning so the user may commit the transaction later */
-				ereport(WARNING, (errmsg("failed to commit prepared transaction '%s'",
-										 transactionName->data),
-								  errhint("Run \"%s\" on %s:%s",
-										  command->data, nodeName, nodePort)));
+				if (stopOnFailure)
+				{
+					ereport(ERROR, (errmsg("failed to commit prepared transaction '%s'",
+										   transactionName->data),
+									errhint("Run \"%s\" on %s:%s",
+											command->data, nodeName, nodePort)));
+				}
+				else
+				{
+					ereport(WARNING, (errmsg("failed to commit prepared transaction '%s'",
+											 transactionName->data),
+									  errhint("Run \"%s\" on %s:%s",
+											  command->data, nodeName, nodePort)));
+				}
 			}
 		}
 		else
@@ -185,8 +196,16 @@ CommitRemoteTransactions(List *connectionList)
 				char *nodeName = ConnectionGetOptionValue(connection, "host");
 				char *nodePort = ConnectionGetOptionValue(connection, "port");
 
-				ereport(WARNING, (errmsg("failed to commit transaction on %s:%s",
-										 nodeName, nodePort)));
+				if (stopOnFailure)
+				{
+					ereport(ERROR, (errmsg("failed to commit transaction on %s:%s",
+										   nodeName, nodePort)));
+				}
+				else
+				{
+					ereport(WARNING, (errmsg("failed to commit transaction on %s:%s",
+											 nodeName, nodePort)));
+				}
 			}
 		}
 

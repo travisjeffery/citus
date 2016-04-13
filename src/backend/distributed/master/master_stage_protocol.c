@@ -42,9 +42,6 @@
 /* Local functions forward declarations */
 static bool WorkerCreateShard(char *nodeName, uint32 nodePort,
 							  uint64 shardId, List *ddlCommandList);
-static bool WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId,
-							 char *shardName, uint64 *shardLength,
-							 text **shardMinValue, text **shardMaxValue);
 static uint64 WorkerTableSize(char *nodeName, uint32 nodePort, Oid relationId,
 							  char *tableName);
 static StringInfo WorkerPartitionValue(char *nodeName, uint32 nodePort, Oid relationId,
@@ -450,7 +447,7 @@ WorkerCreateShard(char *nodeName, uint32 nodePort,
  * WorkerShardStats queries the worker node, and retrieves shard statistics that
  * we assume have changed after new table data have been appended to the shard.
  */
-static bool
+bool
 WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardName,
 				 uint64 *shardLength, text **shardMinValue, text **shardMaxValue)
 {

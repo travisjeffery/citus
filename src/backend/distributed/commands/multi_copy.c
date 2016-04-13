@@ -64,6 +64,7 @@
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_transaction.h"
@@ -161,6 +162,14 @@ static List * ConnectionList(HTAB *connectionHash);
 static void EndRemoteCopy(List *connectionList, bool stopOnFailure);
 static void ReportCopyError(PGconn *connection, PGresult *result);
 static uint32 AvailableColumnCount(TupleDesc tupleDescriptor);
+static void CopyToAppendPartitionedTable(CopyStmt *copyStatement, char *completionTag);
+static void StartCopyToNewShard(CopyOutState copyOutState,
+								ShardConnections *shardConnections,
+								Oid relationId, CopyStmt *copyStatement);
+static void FinalizeCopyToNewShard(CopyOutState copyOutState,
+								   ShardConnections *shardConnections,
+								   Oid relationId, uint64 processedRowCount);
+static void UpdateShardStatistics(Oid relationId, int64 shardId);
 
 /* Private functions copied and adapted from copy.c in PostgreSQL */
 static void CopySendData(CopyOutState outputState, const void *databuf, int datasize);
@@ -233,11 +242,10 @@ CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
 
 	partitionColumn = PartitionColumn(tableId, 0);
 	partitionMethod = PartitionMethod(tableId);
-	if (partitionMethod != DISTRIBUTE_BY_RANGE && partitionMethod != DISTRIBUTE_BY_HASH)
+	if (partitionMethod == DISTRIBUTE_BY_APPEND)
 	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("COPY is only supported for hash- and "
-							   "range-partitioned tables")));
+		CopyToAppendPartitionedTable(copyStatement, completionTag);
+		return;
 	}
 
 	/* resolve hash function for partition column */
@@ -450,7 +458,7 @@ CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
 	 * we do not want any of the transactions rolled back if a failure occurs. Instead,
 	 * they should be rolled forward.
 	 */
-	CommitRemoteTransactions(connectionList);
+	CommitRemoteTransactions(connectionList, false);
 	CloseConnections(connectionList);
 
 	if (completionTag != NULL)
@@ -740,7 +748,7 @@ OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections
 	List *connectionList = NULL;
 
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
-													   "OpenCopyTransactions",
+													   "Open Copy Transactions",
 													   ALLOCSET_DEFAULT_MINSIZE,
 													   ALLOCSET_DEFAULT_INITSIZE,
 													   ALLOCSET_DEFAULT_MAXSIZE);
@@ -1192,6 +1200,282 @@ AppendCopyBinaryFooters(CopyOutState footerOutputState)
 	int16 negative = -1;
 
 	CopySendInt16(footerOutputState, negative);
+}
+
+
+/*
+ * CopyToAppendPartitionedTable implements the COPY table_name FROM ... for
+ * append-partitioned tables.
+ */
+static void
+CopyToAppendPartitionedTable(CopyStmt *copyStatement, char *completionTag)
+{
+	Oid relationId = RangeVarGetRelid(copyStatement->relation, NoLock, false);
+	FmgrInfo *columnOutputFunctions = NULL;
+
+	uint64 shardMaxSizeInBytes = (int64) ShardMaxSize * 1024L;
+	uint64 copiedDataSizeInBytes = 0;
+	uint64 processedRowCount = 0;
+
+	/* allocate column values and nulls arrays */
+	Relation distributedRelation = heap_open(relationId, RowExclusiveLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(distributedRelation);
+	uint32 columnCount = tupleDescriptor->natts;
+	Datum *columnValues = palloc0(columnCount * sizeof(Datum));
+	bool *columnNulls = palloc0(columnCount * sizeof(bool));
+
+	EState *executorState = CreateExecutorState();
+	MemoryContext executorTupleContext = GetPerTupleMemoryContext(executorState);
+	ExprContext *executorExpressionContext = GetPerTupleExprContext(executorState);
+
+	ShardConnections *shardConnections =
+		(ShardConnections *) palloc0(sizeof(ShardConnections));
+
+	/* initialize copy state to read from COPY data source */
+	CopyState copyState = BeginCopyFrom(distributedRelation,
+										copyStatement->filename,
+										copyStatement->is_program,
+										copyStatement->attlist,
+										copyStatement->options);
+
+	CopyOutState copyOutState = (CopyOutState) palloc0(sizeof(CopyOutStateData));
+	copyOutState->binary = true;
+	copyOutState->fe_msgbuf = makeStringInfo();
+	copyOutState->rowcontext = executorTupleContext;
+
+	columnOutputFunctions = ColumnOutputFunctions(tupleDescriptor, copyOutState->binary);
+
+	/* we use a PG_TRY block to close connections on errors (e.g. in NextCopyFrom) */
+	PG_TRY();
+	{
+		ErrorContextCallback errorCallback;
+
+		/* set up callback to identify error line number */
+		errorCallback.callback = CopyFromErrorCallback;
+		errorCallback.arg = (void *) copyState;
+		errorCallback.previous = error_context_stack;
+		error_context_stack = &errorCallback;
+
+		StartCopyToNewShard(copyOutState, shardConnections, relationId, copyStatement);
+
+		while (true)
+		{
+			bool nextRowFound = false;
+			MemoryContext oldContext = NULL;
+			uint64 messageBufferSize = 0;
+
+			ResetPerTupleExprContext(executorState);
+
+			oldContext = MemoryContextSwitchTo(executorTupleContext);
+
+			/* parse a row from the input */
+			nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
+										columnValues, columnNulls, NULL);
+
+			if (!nextRowFound)
+			{
+				MemoryContextSwitchTo(oldContext);
+				break;
+			}
+
+			CHECK_FOR_INTERRUPTS();
+
+			MemoryContextSwitchTo(oldContext);
+
+			/* replicate row to shard placements */
+			resetStringInfo(copyOutState->fe_msgbuf);
+			AppendCopyRowData(columnValues, columnNulls, tupleDescriptor,
+							  copyOutState, columnOutputFunctions);
+			SendCopyDataToAll(copyOutState->fe_msgbuf, shardConnections->connectionList);
+
+			messageBufferSize = copyOutState->fe_msgbuf->len;
+			copiedDataSizeInBytes = copiedDataSizeInBytes + messageBufferSize;
+
+			if (copiedDataSizeInBytes > shardMaxSizeInBytes)
+			{
+				FinalizeCopyToNewShard(copyOutState, shardConnections, relationId,
+									   processedRowCount);
+
+				StartCopyToNewShard(copyOutState, shardConnections, relationId,
+									copyStatement);
+
+				copiedDataSizeInBytes = 0;
+			}
+
+			processedRowCount += 1;
+		}
+
+		/* all lines have been copied, stop showing line number in errors */
+		error_context_stack = errorCallback.previous;
+
+		FinalizeCopyToNewShard(copyOutState, shardConnections, relationId,
+							   processedRowCount);
+
+		EndCopyFrom(copyState);
+		heap_close(distributedRelation, NoLock);
+
+		/* check for cancellation one last time before committing */
+		CHECK_FOR_INTERRUPTS();
+	}
+	PG_CATCH();
+	{
+		/* roll back all transactions */
+		EndRemoteCopy(shardConnections->connectionList, false);
+		AbortRemoteTransactions(shardConnections->connectionList);
+		CloseConnections(shardConnections->connectionList);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (completionTag != NULL)
+	{
+		snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+				 "COPY " UINT64_FORMAT, processedRowCount);
+	}
+}
+
+
+/*
+ * StartCopyToNewShard creates a new shard and related shard placements, opens
+ * connections to shard placements, and starts copy command by sending copy
+ * headers.
+ */
+static void
+StartCopyToNewShard(CopyOutState copyOutState, ShardConnections *shardConnections,
+					Oid relationId, CopyStmt *copyStatement)
+{
+	char *relationName = get_rel_name(relationId);
+	text *relationNameText = cstring_to_text(relationName);
+	Datum relationNameDatum = PointerGetDatum(relationNameText);
+	Datum shardIdDatum = DirectFunctionCall1(master_create_empty_shard,
+											 relationNameDatum);
+
+	int64 shardId = DatumGetInt64(shardIdDatum);
+	shardConnections->shardId = shardId;
+
+	list_free_deep(shardConnections->connectionList);
+	shardConnections->connectionList = NIL;
+
+	OpenCopyTransactions(copyStatement, shardConnections);
+
+	/* send binary headers to shard placements */
+	resetStringInfo(copyOutState->fe_msgbuf);
+	AppendCopyBinaryHeaders(copyOutState);
+	SendCopyDataToAll(copyOutState->fe_msgbuf,
+					  shardConnections->connectionList);
+}
+
+
+/*
+ * FinalizeCopyToNewShard sends copy footers, commits copy transaction, and
+ * closes connections to shard placements. Finally, it calculates shard
+ * statistics and updates metadata.
+ */
+static void
+FinalizeCopyToNewShard(CopyOutState copyOutState, ShardConnections *shardConnections,
+					   Oid relationId, uint64 processedRowCount)
+{
+	/* send binary footers to all shard placements */
+	resetStringInfo(copyOutState->fe_msgbuf);
+	AppendCopyBinaryFooters(copyOutState);
+	SendCopyDataToAll(copyOutState->fe_msgbuf, shardConnections->connectionList);
+
+	/* close the COPY input on all shard placements */
+	EndRemoteCopy(shardConnections->connectionList, true);
+
+	CommitRemoteTransactions(shardConnections->connectionList, true);
+	CloseConnections(shardConnections->connectionList);
+
+	/* if no rows are copied, drop empty shard */
+	if (processedRowCount != 0)
+	{
+		UpdateShardStatistics(relationId, shardConnections->shardId);
+	}
+	else
+	{
+		char *relationName = get_rel_name(relationId);
+
+		Oid schemaId = get_rel_namespace(relationId);
+		char *schemaName = get_namespace_name(schemaId);
+
+		ShardInterval *shardInterval = LoadShardInterval(shardConnections->shardId);
+		List *shardIntervalList = list_make1(shardInterval);
+
+		DropShards(relationId, schemaName, relationName, shardIntervalList);
+	}
+}
+
+
+/*
+ * UpdateShardStatistics updates metadata for the given shard id.
+ */
+static void
+UpdateShardStatistics(Oid relationId, int64 shardId)
+{
+	ShardInterval *shardInterval = LoadShardInterval(shardId);
+	char storageType = shardInterval->storageType;
+	char *shardName = NULL;
+	List *shardPlacementList = NIL;
+	ListCell *shardPlacementCell = NULL;
+	bool statsOK = false;
+	uint64 shardLength = 0;
+	text *minValue = NULL;
+	text *maxValue = NULL;
+
+	/* if shard doesn't have an alias, extend regular table name */
+	shardName = LoadShardAlias(relationId, shardId);
+	if (shardName == NULL)
+	{
+		shardName = get_rel_name(relationId);
+		AppendShardIdToName(&shardName, shardId);
+	}
+
+	shardPlacementList = FinalizedShardPlacementList(shardId);
+
+	/* get appended shard's statistics from a shard placement */
+	foreach(shardPlacementCell, shardPlacementList)
+	{
+		ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+		char *workerName = placement->nodeName;
+		uint32 workerPort = placement->nodePort;
+
+		statsOK = WorkerShardStats(workerName, workerPort, relationId, shardName,
+								   &shardLength, &minValue, &maxValue);
+		if (statsOK)
+		{
+			break;
+		}
+	}
+
+	/*
+	 * If for some reason we appended data to a shard, but failed to retrieve
+	 * statistics we just WARN here to avoid losing shard-state updates. Note
+	 * that this means we will return 0 as the shard fill-factor, and this shard
+	 * also won't be pruned as the statistics will be empty. If the failure was
+	 * transient, a subsequent append call will fetch the correct statistics.
+	 */
+	if (!statsOK)
+	{
+		ereport(WARNING, (errmsg("could not get statistics for shard placement"),
+						  errdetail("Setting shard statistics to NULL")));
+	}
+
+	/* update metadata for each shard placement we appended to */
+	shardPlacementCell = NULL;
+	foreach(shardPlacementCell, shardPlacementList)
+	{
+		ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+		char *workerName = placement->nodeName;
+		uint32 workerPort = placement->nodePort;
+
+		DeleteShardPlacementRow(shardId, workerName, workerPort);
+		InsertShardPlacementRow(shardId, FILE_FINALIZED, shardLength,
+								workerName, workerPort);
+	}
+
+	DeleteShardRow(shardId);
+	InsertShardRow(relationId, shardId, storageType, minValue, maxValue);
 }
 
 

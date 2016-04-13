@@ -50,8 +50,6 @@ static void CheckDeleteCriteria(Node *deleteCriteria);
 static void CheckPartitionColumn(Oid relationId, Node *whereClause);
 static List * ShardsMatchingDeleteCriteria(Oid relationId, List *shardList,
 										   Node *deleteCriteria);
-static int DropShards(Oid relationId, char *schemaName, char *relationName,
-					  List *deletableShardIntervalList);
 static bool ExecuteRemoteCommand(const char *nodeName, uint32 nodePort,
 								 StringInfo queryString);
 
