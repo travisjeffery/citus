@@ -7,22 +7,28 @@
  * The CitusCopyFrom function should be called from the utility hook to
  * process COPY ... FROM commands on distributed tables. CitusCopyFrom
  * parses the input from stdin, a program executed on the master, or a file
- * on the master, and decides into which shard to put the data. It opens a
- * new connection for every shard placement and uses the PQputCopyData
- * function to copy the data. Because PQputCopyData transmits data,
- * asynchronously, the workers will ingest data at least partially in
- * parallel.
+ * on the master, and decides to copy new rows to existing shards or new shards
+ * based on the partition method of the distributed table.
+ *
+ * It opens a new connection for every shard placement and uses the PQputCopyData
+ * function to copy the data. Because PQputCopyData transmits data, asynchronously,
+ * the workers will ingest data at least partially in parallel.
  *
  * When failing to connect to a worker, the master marks the placement for
  * which it was trying to open a connection as inactive, similar to the way
  * DML statements are handled. If a failure occurs after connecting, the
- * transaction is rolled back on all the workers.
+ * transaction is rolled back on all the workers. Note that, if the underlying
+ * table is append-partitioned, metadata changes are rolled back on the master
+ * node, but shard placements are left on the workers.
  *
- * By default, COPY uses normal transactions on the workers. This can cause
- * a problem when some of the transactions fail to commit while others have
- * succeeded. To ensure no data is lost, COPY can use two-phase commit, by
- * increasing max_prepared_transactions on the worker and setting
- * citus.copy_transaction_manager to '2pc'. The default is '1pc'.
+ * By default, COPY uses normal transactions on the workers. In the case of
+ * hash or range-partitioned tables, this can cause a problem when some of the
+ * transactions fail to commit while others have succeeded. To ensure no data
+ * is lost, COPY can use two-phase commit, by increasing max_prepared_transactions
+ * on the worker and setting citus.copy_transaction_manager to '2pc'. The default
+ * is '1pc'. This is not a problem for append-partitioned tables because new
+ * shards are created and in the case of failure, metadata changes are rolled
+ * back on the master node.
  *
  * Parsing options are processed and enforced on the master, while
  * constraints are enforced on the worker. In either case, failure causes
@@ -133,6 +139,8 @@ typedef struct ShardConnections
 
 
 /* Local functions forward declarations */
+static void CopyToHashOrRangePartitionedTable(CopyStmt *copyStatement,
+											  char *completionTag);
 static void LockAllShards(List *shardIntervalList);
 static HTAB * CreateShardConnectionHash(void);
 static int CompareShardIntervalsById(const void *leftElement, const void *rightElement);
@@ -182,17 +190,66 @@ static inline void CopyFlushOutput(CopyOutState outputState, char *start, char *
 
 
 /*
- * CitusCopyFrom implements the COPY table_name FROM ... for hash-partitioned
- * and range-partitioned tables.
+ * CitusCopyFrom implements the COPY table_name FROM. It dispacthes the copy
+ * statement to related subfunctions based on the partition method of the
+ * distributed table.
  */
 void
 CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
 {
 	Oid tableId = RangeVarGetRelid(copyStatement->relation, NoLock, false);
-	char *relationName = get_rel_name(tableId);
-	Relation distributedRelation = NULL;
 	char partitionMethod = '\0';
 	Var *partitionColumn = NULL;
+
+	/* disallow COPY to/from file or program except for superusers */
+	if (copyStatement->filename != NULL && !superuser())
+	{
+		if (copyStatement->is_program)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to COPY to or from an external program"),
+					 errhint("Anyone can COPY to stdout or from stdin. "
+							 "psql's \\copy command also works for anyone.")));
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to COPY to or from a file"),
+					 errhint("Anyone can COPY to stdout or from stdin. "
+							 "psql's \\copy command also works for anyone.")));
+		}
+	}
+
+	partitionColumn = PartitionColumn(tableId, 0);
+	partitionMethod = PartitionMethod(tableId);
+	if (partitionMethod == DISTRIBUTE_BY_HASH || partitionMethod == DISTRIBUTE_BY_RANGE)
+	{
+		CopyToHashOrRangePartitionedTable(copyStatement, completionTag);
+	}
+	else if (partitionMethod == DISTRIBUTE_BY_APPEND)
+	{
+		CopyToAppendPartitionedTable(copyStatement, completionTag);
+	}
+	else
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("unsupported partition method")));
+	}
+}
+
+
+/*
+ * CopyToHashOrRangePartitionedTable implements the COPY table_name FROM ... for
+ * hash or range-partitioned tables.
+ */
+static void
+CopyToHashOrRangePartitionedTable(CopyStmt *copyStatement, char *completionTag)
+{
+	Oid tableId = RangeVarGetRelid(copyStatement->relation, NoLock, false);
+	char *relationName = get_rel_name(tableId);
+	Relation distributedRelation = NULL;
 	TupleDesc tupleDescriptor = NULL;
 	uint32 columnCount = 0;
 	Datum *columnValues = NULL;
@@ -219,34 +276,8 @@ CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
 	FmgrInfo *columnOutputFunctions = NULL;
 	uint64 processedRowCount = 0;
 
-	/* disallow COPY to/from file or program except for superusers */
-	if (copyStatement->filename != NULL && !superuser())
-	{
-		if (copyStatement->is_program)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to COPY to or from an external program"),
-					 errhint("Anyone can COPY to stdout or from stdin. "
-							 "psql's \\copy command also works for anyone.")));
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to COPY to or from a file"),
-					 errhint("Anyone can COPY to stdout or from stdin. "
-							 "psql's \\copy command also works for anyone.")));
-		}
-	}
-
-	partitionColumn = PartitionColumn(tableId, 0);
-	partitionMethod = PartitionMethod(tableId);
-	if (partitionMethod == DISTRIBUTE_BY_APPEND)
-	{
-		CopyToAppendPartitionedTable(copyStatement, completionTag);
-		return;
-	}
+	Var *partitionColumn = PartitionColumn(tableId, 0);
+	char partitionMethod = PartitionMethod(tableId);
 
 	/* resolve hash function for partition column */
 	typeEntry = lookup_type_cache(partitionColumn->vartype, TYPECACHE_HASH_PROC_FINFO);
