@@ -134,11 +134,12 @@ CREATE FUNCTION master_get_local_first_candidate_nodes(OUT node_name text,
 COMMENT ON FUNCTION master_get_local_first_candidate_nodes()
     IS 'fetch set of candidate nodes for shard uploading choosing the local node first';
 
-CREATE FUNCTION master_create_empty_shard(text)
+CREATE FUNCTION master_create_empty_shard(table_name text,
+										  shard_placement_policy integer DEFAULT 3)
     RETURNS bigint
     LANGUAGE C STRICT
     AS 'MODULE_PATHNAME', $$master_create_empty_shard$$;
-COMMENT ON FUNCTION master_create_empty_shard(text)
+COMMENT ON FUNCTION master_create_empty_shard(text, integer)
     IS 'create an empty shard and shard placements for the table';
 
 CREATE FUNCTION master_append_table_to_shard(bigint, text, text, integer)

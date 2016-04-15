@@ -57,7 +57,7 @@ extern char *WorkerListFileName;
 
 
 /* Function declarations for finding worker nodes to place shards on */
-extern WorkerNode * WorkerGetCandidateNode(List *currentNodeList);
+extern WorkerNode * WorkerGetRandomCandidateNode(List *currentNodeList);
 extern WorkerNode * WorkerGetRoundRobinCandidateNode(List *workerNodeList,
 													 uint64 shardId,
 													 uint32 placementIndex);

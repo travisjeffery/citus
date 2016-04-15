@@ -1379,8 +1379,11 @@ StartCopyToNewShard(CopyOutState copyOutState, ShardConnections *shardConnection
 	char *relationName = get_rel_name(relationId);
 	text *relationNameText = cstring_to_text(relationName);
 	Datum relationNameDatum = PointerGetDatum(relationNameText);
-	Datum shardIdDatum = DirectFunctionCall1(master_create_empty_shard,
-											 relationNameDatum);
+
+	Datum shardPlacementPolicyDatum = Int32GetDatum(SHARD_PLACEMENT_ROUND_ROBIN);
+	Datum shardIdDatum = DirectFunctionCall2(master_create_empty_shard,
+											 relationNameDatum,
+											 shardPlacementPolicyDatum);
 
 	int64 shardId = DatumGetInt64(shardIdDatum);
 	shardConnections->shardId = shardId;

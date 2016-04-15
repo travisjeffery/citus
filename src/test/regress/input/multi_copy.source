@@ -256,4 +256,21 @@ COPY lineitem_copy_append FROM '@abs_srcdir@/data/lineitem.1.data' with delimite
 
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = 'lineitem_copy_append'::regclass;
 
+-- Test round robin shard policy
+set citus.shard_replication_factor to 1;
+
+COPY lineitem_copy_append FROM '@abs_srcdir@/data/lineitem.2.data' with delimiter '|';
+
+SELECT
+        pg_dist_shard_placement.shardid,
+        pg_dist_shard_placement.nodeport
+FROM
+        pg_dist_shard,
+        pg_dist_shard_placement
+WHERE
+        pg_dist_shard.shardid = pg_dist_shard_placement.shardid AND
+        logicalrelid = 'lineitem_copy_append'::regclass AND
+        pg_dist_shard.shardid >= 103250;
+
 SET citus.shard_max_size TO DEFAULT;
+SET citus.shard_replication_factor to DEFAULT;
