@@ -55,8 +55,8 @@ static bool WorkerNodeResponsive(const char *workerName, uint32 workerPort);
  */
 
 /*
- * WorkerGetCandidateNode takes in a list of worker nodes, and then allocates a
- * new worker node. The allocation is performed according to the following
+ * WorkerGetRandomCandidateNode takes in a list of worker nodes, and then allocates
+ * a new worker node. The allocation is performed according to the following
  * policy: if the list is empty, a random node is allocated; if the list has one
  * node (or an odd number of nodes), the new node is allocated on a different
  * rack than the first node; and if the list has two nodes (or an even number of
@@ -69,7 +69,7 @@ static bool WorkerNodeResponsive(const char *workerName, uint32 workerPort);
  * contain enough nodes to allocate a new worker node.
  */
 WorkerNode *
-WorkerGetCandidateNode(List *currentNodeList)
+WorkerGetRandomCandidateNode(List *currentNodeList)
 {
 	WorkerNode *workerNode = NULL;
 	bool wantSameRack = false;

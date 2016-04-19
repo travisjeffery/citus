@@ -355,7 +355,7 @@ master_get_local_first_candidate_nodes(PG_FUNCTION_ARGS)
 		else
 		{
 			/* find a candidate node different from those already selected */
-			candidateNode = WorkerGetCandidateNode(currentNodeList);
+			candidateNode = WorkerGetRandomCandidateNode(currentNodeList);
 			if (candidateNode == NULL)
 			{
 				ereport(ERROR, (errmsg("could only find %u of %u required nodes",
