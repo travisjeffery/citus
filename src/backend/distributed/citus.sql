@@ -194,6 +194,13 @@ COMMENT ON FUNCTION master_create_distributed_table(table_name regclass,
                                                     distribution_method citus.distribution_type)
     IS 'define the table distribution functions';
 
+CREATE FUNCTION master_update_shard_statistics(relation_id regclass, shard_id bigint)
+    RETURNS bigint
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$master_update_shard_statistics$$;
+COMMENT ON FUNCTION master_update_shard_statistics(relation_id regclass, shard_id bigint)
+    IS 'update shard statistics and return the updated shard size';
+
 -- define shard creation function for hash-partitioned tables
 CREATE FUNCTION master_create_worker_shards(table_name text, shard_count integer,
                                             replication_factor integer DEFAULT 2)

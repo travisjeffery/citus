@@ -11,6 +11,7 @@
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -287,6 +288,45 @@ VerifyTransmitStmt(CopyStmt *copyStatement)
 }
 
 
+static void
+CreateLocalTable(char *relationName, char *nodeName, int32 nodePort)
+{
+	List *ddlCommandList = NIL;
+	ListCell *ddlCommandCell = NULL;
+
+	/* fetch the ddl commands needed to create the table */
+	StringInfo tableNameStringInfo = makeStringInfo();
+	appendStringInfoString(tableNameStringInfo, relationName);
+
+	ddlCommandList = TableDDLCommandList(nodeName, nodePort, tableNameStringInfo);
+	if (ddlCommandList == NIL)
+	{
+		ereport(ERROR, (errmsg("relation %s does not exist on the master",
+							   relationName)));
+	}
+
+	/* apply DDL commands against the local database */
+	foreach(ddlCommandCell, ddlCommandList)
+	{
+		StringInfo ddlCommand = (StringInfo) lfirst(ddlCommandCell);
+		Node *ddlCommandNode = ParseTreeNode(ddlCommand->data);
+
+		if (IsA(ddlCommandNode, CreateStmt))
+		{
+			CreateStmt *createStatement = (CreateStmt *) ddlCommandNode;
+
+			/* use temprorary table and drop it on commit */
+			createStatement->relation->relpersistence = RELPERSISTENCE_TEMP;
+			createStatement->oncommit = ONCOMMIT_DROP;
+		}
+
+		ProcessUtility(ddlCommandNode, ddlCommand->data, PROCESS_UTILITY_TOPLEVEL,
+					   NULL, None_Receiver, NULL);
+		CommandCounterIncrement();
+	}
+}
+
+
 /*
  * ProcessCopyStmt handles Citus specific concerns for COPY like supporting
  * COPYing from distributed tables and preventing unsupported actions. The
@@ -311,21 +351,41 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, bool *commandMustR
 	 */
 	if (copyStatement->relation != NULL)
 	{
-		Relation copiedRelation = NULL;
 		bool isDistributedRelation = false;
-		bool isFrom = copyStatement->is_from;
+		bool isCopyFromWorker = IsCopyFromWorker(copyStatement);
 
-		/* consider using RangeVarGetRelidExtended to check perms before locking */
-		copiedRelation = heap_openrv(copyStatement->relation,
-									 isFrom ? RowExclusiveLock : AccessShareLock);
+		if (isCopyFromWorker)
+		{
+			NodeAddress *masterNodeAddress = MasterNodeAddress(copyStatement);
+			char *relationName = copyStatement->relation->relname;
+			char *nodeName = masterNodeAddress->nodeName;
+			int32 nodePort = masterNodeAddress->nodePort;
 
-		isDistributedRelation = IsDistributedTable(RelationGetRelid(copiedRelation));
+			CreateLocalTable(relationName, nodeName, nodePort);
 
-		/* ensure future lookups hit the same relation */
-		copyStatement->relation->schemaname = get_namespace_name(
-			RelationGetNamespace(copiedRelation));
+			/*
+			 * We expect copy from worker to be on a distributed table; otherwise,
+			 * it fails in CitusCopyFrom() while checking the partition method.
+			 */
+			isDistributedRelation = true;
+		}
+		else
+		{
+			bool isFrom = copyStatement->is_from;
+			Relation copiedRelation = NULL;
 
-		heap_close(copiedRelation, NoLock);
+			/* consider using RangeVarGetRelidExtended to check perms before locking */
+			copiedRelation = heap_openrv(copyStatement->relation,
+										 isFrom ? RowExclusiveLock : AccessShareLock);
+
+			isDistributedRelation = IsDistributedTable(RelationGetRelid(copiedRelation));
+
+			/* ensure future lookups hit the same relation */
+			copyStatement->relation->schemaname = get_namespace_name(
+				RelationGetNamespace(copiedRelation));
+
+			heap_close(copiedRelation, NoLock);
+		}
 
 		if (isDistributedRelation)
 		{
