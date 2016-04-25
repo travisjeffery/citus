@@ -1147,18 +1147,44 @@ CountDistinctAggregateWalker(Node *node, List **distinctGroupByList)
 		{
 			List *aggTargetEntryList = aggregate->args;
 			TargetEntry *distinctTargetEntry = linitial(aggTargetEntryList);
-
-			List *aggDistinctList = aggregate->aggdistinct;
-			SortGroupClause *distinctGroupBy = linitial(aggDistinctList);
-
+			List *columnList = pull_var_clause_default((Node*) distinctTargetEntry);
+			ListCell *columnCell = NULL;
+			List *addedColumnList = NIL;
 			int32 distinctColumnCount = list_length(*distinctGroupByList);
-			Index distinctColumnSortGroupRefIndex =
-					BASE_SORT_GROUP_REF + distinctColumnCount;
+			Index distinctColumnSortGroupRefIndex = BASE_SORT_GROUP_REF + distinctColumnCount;
 
 			distinctTargetEntry->ressortgroupref = distinctColumnSortGroupRefIndex;
-			distinctGroupBy->tleSortGroupRef = distinctColumnSortGroupRefIndex;
 
-			(*distinctGroupByList) = lappend(*distinctGroupByList, distinctGroupBy);
+			foreach(columnCell, columnList)
+			{
+				Var *columnVar = (Var *) lfirst(columnCell);
+				Oid opLt = InvalidOid;
+				Oid opEq = InvalidOid;
+				Oid opGt = InvalidOid;
+				bool hashable = false;
+				SortGroupClause *newDistinctGroupBy = NULL;
+
+				if (list_member(addedColumnList, columnVar))
+				{
+					continue;
+				}
+
+				addedColumnList = lappend(addedColumnList, columnVar);
+
+				newDistinctGroupBy = makeNode(SortGroupClause);
+
+				get_sort_group_operators(columnVar->vartype, true, true, true, &opLt, &opEq, &opGt, &hashable);
+
+				newDistinctGroupBy->eqop = opEq;
+				newDistinctGroupBy->hashable = hashable;
+				newDistinctGroupBy->nulls_first = false;
+				newDistinctGroupBy->sortop = opLt;
+				newDistinctGroupBy->tleSortGroupRef = distinctColumnSortGroupRefIndex;
+
+				(*distinctGroupByList) = lappend(*distinctGroupByList, newDistinctGroupBy);
+				distinctColumnSortGroupRefIndex++;
+			}
+
 			walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
 												  (void *) distinctGroupByList);
 		}
@@ -1394,13 +1420,47 @@ MasterAggregateExpression(Aggref *originalAggregate, AttrNumber *columnId)
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *aggTargetEntryList = aggregate->args;
 		TargetEntry *distinctTargetEntry = linitial(aggTargetEntryList);
-		Var *distinctColumn = (Var *) distinctTargetEntry->expr;
-		distinctColumn->varattno = (*columnId);
-		distinctColumn->varoattno =  (*columnId);
+		List *varList = pull_var_clause_default((Node *) distinctTargetEntry->expr);
+		ListCell *varCell = NULL;
+		List *uniqueVarList = NIL;
+		int startColumnCount = (*columnId);
+
+		/* first determine number of unique var's */
+		foreach(varCell, varList)
+		{
+			Var *var = (Var *)  lfirst(varCell);
+			uniqueVarList = list_append_unique(uniqueVarList, var);
+		}
+
+		/* we will be adding that many columns */
+		(*columnId) += list_length(uniqueVarList);
+
+		/* reset unique var list, update each var's attribute number with new column no */
+		uniqueVarList = NIL;
+
+		foreach(varCell,varList)
+		{
+			Var *columnToUpdate = (Var *) lfirst(varCell);
+			ListCell *uniqueVarCell = NULL;
+			int columnIndex = 0;
+
+			foreach(uniqueVarCell,uniqueVarList)
+			{
+				Var *currentVar = (Var *) lfirst(uniqueVarCell);
+				if (equal(columnToUpdate, currentVar))
+				{
+					break;
+				}
+				columnIndex++;
+			}
+
+			uniqueVarList = list_append_unique(uniqueVarList, copyObject(columnToUpdate));
+
+			columnToUpdate->varattno = startColumnCount + columnIndex;
+			columnToUpdate->varoattno = startColumnCount + columnIndex;
+		}
 
 		newMasterExpression = (Expr *) aggregate;
-
-		(*columnId)++;
 	}
 	else if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate != DISABLE_DISTINCT_APPROXIMATION)
@@ -1705,6 +1765,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 		Expr *originalExpression = originalTargetEntry->expr;
 		List *newExpressionList = NIL;
 		ListCell *newExpressionCell = NULL;
+		int targetIndex = 1;
 
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
 		if (hasAggregates)
@@ -1723,6 +1784,24 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			TargetEntry *newTargetEntry = copyObject(originalTargetEntry);
 			newTargetEntry->expr = newExpression;
 
+
+
+			if (IsA(newExpression, TargetEntry))
+			{
+				TargetEntry *distinctTargetEntry = (TargetEntry *) newExpression;
+				Expr *distinctColumn = (Expr *) copyObject(distinctTargetEntry->expr);
+				StringInfo aggregateColumnName = makeStringInfo();
+
+				newTargetEntry->expr = (Expr *) distinctColumn;
+				newTargetEntry->ressortgroupref = distinctTargetEntry->ressortgroupref;
+
+				if (newTargetEntry->resname != NULL)
+				{
+					appendStringInfo(aggregateColumnName, "%s_%d", newTargetEntry->resname, targetIndex);
+					newTargetEntry->resname = aggregateColumnName->data;
+				}
+			}
+
 			if (newTargetEntry->resname == NULL)
 			{
 				StringInfo columnNameString = makeStringInfo();
@@ -1732,21 +1811,13 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 				newTargetEntry->resname = columnNameString->data;
 			}
 
-			if (IsA(newExpression, TargetEntry))
-			{
-				TargetEntry *distinctTargetEntry = (TargetEntry *) newExpression;
-				Var *distinctColumn = (Var *) copyObject(distinctTargetEntry->expr);
-
-				newTargetEntry->expr = (Expr *) distinctColumn;
-				newTargetEntry->ressortgroupref = distinctTargetEntry->ressortgroupref;
-			}
-
 			/* force resjunk to false as we may need this on the master */
 			newTargetEntry->resjunk = false;
 			newTargetEntry->resno = targetProjectionNumber;
 			targetProjectionNumber++;
 
 			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
+			targetIndex++;
 		}
 	}
 
@@ -1817,8 +1888,30 @@ WorkerAggregateExpressionList(Aggref *originalAggregate)
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *aggTargetEntryList = aggregate->args;
 		TargetEntry *distinctTargetEntry = (TargetEntry *) linitial(aggTargetEntryList);
+		List *columnList = pull_var_clause_default((Node *) distinctTargetEntry);
+		ListCell *columnCell = NULL;
+		Index sortGroupRef = distinctTargetEntry->ressortgroupref;
+		List *groupRefList = NIL;
 
-		workerAggregateList = lappend(workerAggregateList, distinctTargetEntry);
+		foreach(columnCell, columnList)
+		{
+			TargetEntry * newTargetEntry = makeNode(TargetEntry);
+			Var *column = (Var *) lfirst(columnCell);
+			newTargetEntry->expr = copyObject(column);
+			newTargetEntry->resno = 0;
+			newTargetEntry->resname = NULL;
+			newTargetEntry->ressortgroupref = sortGroupRef;
+
+			if (list_member(groupRefList, column))
+			{
+				continue;
+			}
+			groupRefList = lappend(groupRefList, column);
+
+			workerAggregateList = lappend(workerAggregateList, newTargetEntry);
+			sortGroupRef++;
+		}
+
 	}
 	else if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate != DISABLE_DISTINCT_APPROXIMATION)
@@ -2242,6 +2335,9 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	bool distinctSupported = true;
 	List *repartitionNodeList = NIL;
 	Var *distinctColumn = NULL;
+	List *tableNodeList = NIL;
+	List *opNodeList = NIL;
+	MultiExtendedOp *extendedOpNode = NULL;
 
 	AggregateType aggregateType = GetAggregateType(aggregateExpression->aggfnoid);
 
@@ -2280,19 +2376,27 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 		errorDetail = "aggregate (distinct) with table repartitioning is unsupported";
 	}
 
+	tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
+	opNodeList = FindNodesOfType(logicalPlanNode, T_MultiExtendedOp);
+	extendedOpNode = (MultiExtendedOp *) linitial(opNodeList);
+
 	distinctColumn = AggregateDistinctColumn(aggregateExpression);
 	if (distinctColumn == NULL)
 	{
-		distinctSupported = false;
-		errorDetail = "aggregate (distinct) on complex expressions is unsupported";
+		/*
+		 * If the query has a single table, and table is grouped by partition column,
+		 * then we support count distincts even distinct column can not be identified.
+		 */
+		distinctSupported = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
+																	  distinctColumn);
+
+		if (!distinctSupported)
+		{
+			errorDetail = "aggregate (distinct) on complex expressions is unsupported";
+		}
 	}
 	else
 	{
-		List *tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
-
-		List *opNodeList = FindNodesOfType(logicalPlanNode, T_MultiExtendedOp);
-		MultiExtendedOp *extendedOpNode = (MultiExtendedOp *) linitial(opNodeList);
-
 		bool supports = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
 														  distinctColumn);
 		if (!supports)
@@ -2398,15 +2502,15 @@ TablePartitioningSupportsDistinct(List *tableNodeList, MultiExtendedOp *opNode,
 		 * if table is range partitioned.
 		 */
 		partitionMethod = PartitionMethod(relationId);
-
-		if (partitionMethod == DISTRIBUTE_BY_RANGE
-				|| partitionMethod == DISTRIBUTE_BY_HASH)
+		if (partitionMethod == DISTRIBUTE_BY_RANGE ||
+			partitionMethod == DISTRIBUTE_BY_HASH)
 		{
 			Var *tablePartitionColumn = tableNode->partitionColumn;
 			bool groupedByPartitionColumn = false;
 
 			/* if distinct is on table partition column, we can push it down */
-			if (tablePartitionColumn->varno == distinctColumn->varno &&
+			if (distinctColumn != NULL &&
+				tablePartitionColumn->varno == distinctColumn->varno &&
 				tablePartitionColumn->varattno == distinctColumn->varattno)
 			{
 				tableDistinctSupported = true;
