@@ -1927,6 +1927,7 @@ SubquerySqlTaskList(Job *job)
 	uint32 anchorRangeTableId = 0;
 	uint32 rangeTableIndex = 0;
 	const uint32 fragmentSize = sizeof(RangeTableFragment);
+	uint64 largestTableSize = 0;
 
 	/* find filters on partition columns */
 	ExtractQueryWalker((Node *) subquery, &queryList);
@@ -1950,7 +1951,6 @@ SubquerySqlTaskList(Job *job)
 
 	/* get list of all range tables in subquery tree */
 	ExtractRangeTableRelationWalker((Node *) subquery, &rangeTableList);
-	anchorRangeTableId = AnchorRangeTableId(rangeTableList);
 
 	/*
 	 * For each range table entry, first we prune shards for the relation
@@ -1968,6 +1968,7 @@ SubquerySqlTaskList(Job *job)
 		ListCell *shardIntervalCell = NULL;
 		uint32 tableId = rangeTableIndex + 1; /* tableId starts from 1 */
 		uint32 finalShardCount = 0;
+		uint64 tableSize = 0;
 
 		if (opExpressionList != NIL)
 		{
@@ -1995,6 +1996,8 @@ SubquerySqlTaskList(Job *job)
 		{
 			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 
+			tableSize += ShardLength(shardInterval->shardId);
+
 			RangeTableFragment *shardFragment = palloc0(fragmentSize);
 			shardFragment->fragmentReference = &(shardInterval->shardId);
 			shardFragment->fragmentType = CITUS_RTE_RELATION;
@@ -2014,6 +2017,12 @@ SubquerySqlTaskList(Job *job)
 				/* get next fragment for the first relation list */
 				fragmentCombinationCell = lnext(fragmentCombinationCell);
 			}
+		}
+
+		if (anchorRangeTableId == 0 || tableSize > largestTableSize)
+		{
+			largestTableSize = tableSize;
+			anchorRangeTableId = tableId;
 		}
 
 		rangeTableIndex++;
