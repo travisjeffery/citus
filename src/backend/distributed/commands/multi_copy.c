@@ -1065,6 +1065,12 @@ OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections
 		ereport(ERROR, (errmsg("could not find any active placements")));
 	}
 
+	/*
+	 * If stopOnFailure is true, we just error out and code execution should
+	 * never reach to this point. This is the case for copy from worker nodes.
+	 */
+	Assert(!stopOnFailure || list_length(failedPlacementList) == 0);
+
 	/* otherwise, mark failed placements as inactive: they're stale */
 	foreach(failedPlacementCell, failedPlacementList)
 	{
