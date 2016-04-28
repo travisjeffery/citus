@@ -3497,8 +3497,7 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 		secondTableCache->sortedShardIntervalArray;
 	uint32 firstListShardCount = firstTableCache->shardIntervalArrayLength;
 	uint32 secondListShardCount = secondTableCache->shardIntervalArrayLength;
-	FmgrInfo *comparisonFunction = NULL;
-	Oid typeId = InvalidOid;
+	FmgrInfo *comparisonFunction = firstTableCache->shardIntervalCompareFunction;
 
 	if (firstListShardCount != secondListShardCount)
 	{
@@ -3511,8 +3510,7 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 		return true;
 	}
 
-	typeId = sortedFirstIntervalArray[0]->valueTypeId;
-	comparisonFunction = GetFunctionInfo(typeId, BTREE_AM_OID, BTORDER_PROC);
+	Assert(comparisonFunction != NULL);
 
 	for (intervalIndex = 0; intervalIndex < firstListShardCount; intervalIndex++)
 	{
