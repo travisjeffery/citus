@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+echo "WARNING: copy_to_distributed_table is deprecated."
+echo "HINT: You can now use \\COPY on distributed tables, which is considerably faster."
 
 # make bash behave
 set -euo pipefail
