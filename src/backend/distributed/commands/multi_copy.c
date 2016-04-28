@@ -275,45 +275,58 @@ CopyFromWorkerNode(CopyStmt *copyStatement, char *completionTag)
 	NodeAddress *masterNodeAddress = MasterNodeAddress(copyStatement);
 	char *nodeName = masterNodeAddress->nodeName;
 	int32 nodePort = masterNodeAddress->nodePort;
-
 	char *nodeUser = CurrentUserName();
+
 	PGconn *masterConnection = ConnectToNode(nodeName, nodePort, nodeUser);
 
-	char *relationName = copyStatement->relation->relname;
-	PGresult *queryResult = NULL;
-
-	char partitionMethod = RemotePartitionMethod(relationName, masterConnection);
-	if (partitionMethod != DISTRIBUTE_BY_APPEND)
+	PG_TRY();
 	{
-		ereport(ERROR, (errmsg("copy from worker nodes are only supported "
-							   "for append-partitioned tables")));
-	}
+		PGresult *queryResult = NULL;
+		char *relationName = copyStatement->relation->relname;
 
-	/* run all metadata commands in a transaction */
-	queryResult = PQexec(masterConnection, "BEGIN");
-	if (PQresultStatus(queryResult) != PGRES_COMMAND_OK)
+		char partitionMethod = RemotePartitionMethod(relationName, masterConnection);
+		if (partitionMethod != DISTRIBUTE_BY_APPEND)
+		{
+			ereport(ERROR, (errmsg("copy from worker nodes are only supported "
+								   "for append-partitioned tables")));
+		}
+
+		/* run all metadata commands in a transaction */
+		queryResult = PQexec(masterConnection, "BEGIN");
+		if (PQresultStatus(queryResult) != PGRES_COMMAND_OK)
+		{
+			ereport(ERROR, (errmsg("failed to start updating the metadata on the "
+								   "master node")));
+		}
+
+		PQclear(queryResult);
+
+		/*
+		 * Remove master node options from the copy statement becasue they are not
+		 * recognized by PostgreSQL machinery.
+		 */
+		RemoveMasterOptions(copyStatement);
+		CopyToNewShards(copyStatement, completionTag, masterConnection);
+
+		/* commit metadata transactions */
+		queryResult = PQexec(masterConnection, "COMMIT");
+		if (PQresultStatus(queryResult) != PGRES_COMMAND_OK)
+		{
+			ereport(ERROR, (errmsg("failed to commit metadata changes on the master node")));
+		}
+
+		PQclear(queryResult);
+	}
+	PG_CATCH();
 	{
-		ereport(ERROR, (errmsg("failed to start updating the metadata on the "
-							   "master node")));
+		/* close the connection */
+		PQfinish(masterConnection);
+
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
 
-	PQclear(queryResult);
-
-	/*
-	 * Remove master node options from the copy statement becasue they are not
-	 * recognized by PostgreSQL machinery.
-	 */
-	RemoveMasterOptions(copyStatement);
-	CopyToNewShards(copyStatement, completionTag, masterConnection);
-
-	/* commit metadata transactions */
-	queryResult = PQexec(masterConnection, "COMMIT");
-	if (PQresultStatus(queryResult) != PGRES_COMMAND_OK)
-	{
-		ereport(ERROR, (errmsg("failed to commit metadata changes on the master node")));
-	}
-
-	PQclear(queryResult);
+	PQfinish(masterConnection);
 }
 
 
