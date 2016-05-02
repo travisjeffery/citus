@@ -22,4 +22,8 @@ RUN ./configure && \
 
 WORKDIR /
 
+RUN echo "shared_preload_libraries='citus'" >> /usr/share/postgresql/postgresql.conf.sample
+
+COPY 000-symlink-workerlist.sh 001-create-citus-extension.sql /docker-entrypoint-initdb.d/
+
 VOLUME /etc/citus
